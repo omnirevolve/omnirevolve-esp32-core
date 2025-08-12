@@ -38,6 +38,17 @@
 #define STREAM_BYTES_PER_SEC   (STREAM_F_HZ/2)  // 1 байт = 2 ниббла => 5000 Б/с при 10 кГц
 #define STREAM_RATE_SAFETY_PC  98      // учёт overhead (%, 98% от теории)
 
+#define STREAM_CMD_REQUEST_MORE  0x14
+#define STREAM_CMD_END          0x15
+#define STREAM_CMD_ACK          0x16
+
+// Continuous streaming parameters
+#define CONTINUOUS_CHUNK_SIZE    2048   // Send 2KB chunks
+#define CONTINUOUS_BUFFER_SIZE   16384  // 16KB buffer for continuous data
+
+#define HEARTBEAT_PERIOD_MS    1000
+#define CONNECT_TIMEOUT_MS     3000
+
 // CRC16-CCITT (0xFFFF, poly 0x1021), как на STM32
 static inline uint16_t crc16_ccitt(uint16_t crc, uint8_t b) {
     crc ^= (uint16_t)b << 8;
@@ -124,12 +135,34 @@ static spi_device_handle_t spi;
 static u8g2_t u8g2;
 
 typedef struct {
+    uint8_t active;
+    uint8_t *buffer;
+    size_t buffer_size;
+    size_t write_pos;
+    size_t read_pos;
+    size_t total_sent;
+    size_t total_generated;
+    uint8_t generation_complete;
+    TaskHandle_t generator_task;
+    TaskHandle_t sender_task;
+    SemaphoreHandle_t buffer_mutex;
+    SemaphoreHandle_t data_ready_sem;
+} continuous_stream_t;
+
+static continuous_stream_t cont_stream = {0};
+
+typedef struct {
 	uint32_t request_id;
 	CmdState_t cmd_state;
 } CurrentCommand_t;
 
 typedef struct {
-    bool is_connected;
+    volatile bool is_connected;
+    TickType_t last_heartbeat_sent;
+    TickType_t last_status_request;
+    TickType_t last_rx_any;        // время последнего ЛЮБОГО валидного ответа
+    TickType_t last_rx_heartbeat;  // время последнего HEARTBEAT от STM32
+
     bool is_calibrated;
     bool is_homed;
     bool is_processing_cmd;
@@ -147,11 +180,6 @@ typedef struct {
     uint16_t feedrate;
     float speed_factor;
     
-    uint32_t last_heartbeat_sent;
-    uint32_t last_heartbeat_received;
-    uint32_t last_status_request;
-    uint32_t last_position_request;
-    
     bool heartbeat_ok;
     char status_text[64];
     char last_command[64];  // Increased from 32
@@ -162,6 +190,10 @@ typedef struct {
 
 static plotter_state_t plotter = {
     .is_connected = false,
+    .last_heartbeat_sent = 0,
+    .last_status_request = 0,
+    .last_rx_any = 0,
+    .last_rx_heartbeat = 0,
     .is_calibrated = false,
     .is_homed = false,
     .is_processing_cmd = false,
@@ -425,7 +457,199 @@ static void stream_circle_task(void *pv)
 
     vTaskDelete(NULL);
 }
-// =============================== TEST STREAMING END 2 ===================================
+// =============================== STREAMING FNCs ===================================
+
+// Initialize continuous streaming
+static void continuous_stream_init(void) {
+    if (cont_stream.buffer) {
+        free(cont_stream.buffer);
+    }
+    
+    cont_stream.buffer = malloc(CONTINUOUS_BUFFER_SIZE);
+    cont_stream.buffer_size = CONTINUOUS_BUFFER_SIZE;
+    cont_stream.write_pos = 0;
+    cont_stream.read_pos = 0;
+    cont_stream.total_sent = 0;
+    cont_stream.total_generated = 0;
+    cont_stream.generation_complete = 0;
+    cont_stream.active = 1;
+    
+    if (!cont_stream.buffer_mutex) {
+        cont_stream.buffer_mutex = xSemaphoreCreateMutex();
+    }
+    if (!cont_stream.data_ready_sem) {
+        cont_stream.data_ready_sem = xSemaphoreCreateBinary();
+    }
+}
+
+// Clean up continuous streaming
+static void continuous_stream_cleanup(void) {
+    cont_stream.active = 0;
+    
+    if (cont_stream.generator_task) {
+        vTaskDelete(cont_stream.generator_task);
+        cont_stream.generator_task = NULL;
+    }
+    if (cont_stream.sender_task) {
+        vTaskDelete(cont_stream.sender_task);
+        cont_stream.sender_task = NULL;
+    }
+    
+    if (cont_stream.buffer) {
+        free(cont_stream.buffer);
+        cont_stream.buffer = NULL;
+    }
+}
+
+// Generate continuous pattern (example: spiral)
+static void continuous_spiral_generator(void *pvParams) {
+    float cx_mm = plotter.x_max / 2.0f;
+    float cy_mm = plotter.y_max / 2.0f;
+    float max_r = fminf(plotter.x_max, plotter.y_max) / 2.0f - 5.0f;
+    float r = 5.0f;  // Start radius
+    float theta = 0.0f;
+    float r_increment = 0.5f;  // Spiral tightness
+    float theta_increment = 0.1f;  // Angular resolution
+    
+    float acc_x = 0.0f, acc_y = 0.0f;
+    float prev_x = cx_mm + r;
+    float prev_y = cy_mm;
+    
+    printf("SPIRAL: Generating continuous spiral pattern\n");
+    
+    while (cont_stream.active && r < max_r) {
+        // Calculate next point
+        float x = cx_mm + r * cosf(theta);
+        float y = cy_mm + r * sinf(theta);
+        
+        // Calculate steps
+        float dx_mm = x - prev_x;
+        float dy_mm = y - prev_y;
+        
+        acc_x += dx_mm * STEPS_PER_MM;
+        acc_y += dy_mm * STEPS_PER_MM;
+        
+        uint8_t x_step = 0, x_dir = 0, y_step = 0, y_dir = 0;
+        
+        if (acc_x >= 1.0f) {
+            x_step = 1; x_dir = 1;
+            acc_x -= 1.0f;
+        } else if (acc_x <= -1.0f) {
+            x_step = 1; x_dir = 0;
+            acc_x += 1.0f;
+        }
+        
+        if (acc_y >= 1.0f) {
+            y_step = 1; y_dir = 1;
+            acc_y -= 1.0f;
+        } else if (acc_y <= -1.0f) {
+            y_step = 1; y_dir = 0;
+            acc_y += 1.0f;
+        }
+        
+        // Create nibble
+        uint8_t nib = 0;
+        if (x_step) nib |= 0x01;
+        if (x_dir) nib |= 0x02;
+        if (y_step) nib |= 0x04;
+        if (y_dir) nib |= 0x08;
+        
+        // Wait for space in buffer
+        while (1) {
+            xSemaphoreTake(cont_stream.buffer_mutex, portMAX_DELAY);
+            size_t used = (cont_stream.write_pos >= cont_stream.read_pos) ?
+                         (cont_stream.write_pos - cont_stream.read_pos) :
+                         (CONTINUOUS_BUFFER_SIZE - cont_stream.read_pos + cont_stream.write_pos);
+            
+            if (used < CONTINUOUS_BUFFER_SIZE - 2) {
+                // Pack two nibbles per byte
+                static uint8_t byte_buffer = 0;
+                static int nibble_count = 0;
+                
+                if (nibble_count == 0) {
+                    byte_buffer = nib;
+                    nibble_count = 1;
+                } else {
+                    byte_buffer |= (nib << 4);
+                    cont_stream.buffer[cont_stream.write_pos] = byte_buffer;
+                    cont_stream.write_pos = (cont_stream.write_pos + 1) % CONTINUOUS_BUFFER_SIZE;
+                    cont_stream.total_generated++;
+                    nibble_count = 0;
+                    
+                    // Signal data available
+                    xSemaphoreGive(cont_stream.data_ready_sem);
+                }
+                
+                xSemaphoreGive(cont_stream.buffer_mutex);
+                break;
+            }
+            xSemaphoreGive(cont_stream.buffer_mutex);
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        
+        prev_x = x;
+        prev_y = y;
+        
+        // Update spiral
+        theta += theta_increment;
+        if (theta >= 2 * M_PI) {
+            theta -= 2 * M_PI;
+            r += r_increment;
+        }
+    }
+    
+    cont_stream.generation_complete = 1;
+    printf("SPIRAL: Generation complete, total bytes: %zu\n", cont_stream.total_generated);
+    vTaskDelete(NULL);
+}
+
+// Handle data request from STM32
+static void handle_stream_request(uint16_t requested_bytes) {
+    if (!cont_stream.active) return;
+    
+    printf("STREAM_REQ: STM32 requested %u bytes\n", requested_bytes);
+    
+    xSemaphoreTake(cont_stream.buffer_mutex, portMAX_DELAY);
+    
+    size_t available = (cont_stream.write_pos >= cont_stream.read_pos) ?
+                      (cont_stream.write_pos - cont_stream.read_pos) :
+                      (CONTINUOUS_BUFFER_SIZE - cont_stream.read_pos + cont_stream.write_pos);
+    
+    size_t to_send = (available < requested_bytes) ? available : requested_bytes;
+    
+    if (to_send > 0) {
+        // Send data in chunks
+        uint8_t chunk[CONTINUOUS_CHUNK_SIZE];
+        size_t sent = 0;
+        
+        while (sent < to_send) {
+            size_t chunk_size = (to_send - sent < CONTINUOUS_CHUNK_SIZE) ? 
+                               (to_send - sent) : CONTINUOUS_CHUNK_SIZE;
+            
+            // Copy from circular buffer
+            for (size_t i = 0; i < chunk_size; i++) {
+                chunk[i] = cont_stream.buffer[cont_stream.read_pos];
+                cont_stream.read_pos = (cont_stream.read_pos + 1) % CONTINUOUS_BUFFER_SIZE;
+            }
+            
+            // Send DATA frame
+            stream_send_frame(STREAM_CMD_DATA, chunk, chunk_size);
+            sent += chunk_size;
+            cont_stream.total_sent += chunk_size;
+        }
+        
+        printf("STREAM_REQ: Sent %zu bytes (total: %zu)\n", sent, cont_stream.total_sent);
+    } else if (cont_stream.generation_complete) {
+        // No more data and generation complete - send END
+        stream_send_frame(STREAM_CMD_END, NULL, 0);
+        printf("STREAM_REQ: Sent END signal\n");
+        continuous_stream_cleanup();
+    } else {
+        printf("STREAM_REQ: No data available yet\n");
+    }
+    
+    xSemaphoreGive(cont_stream.buffer_mutex);
+}
 
 // =============================== TEST STREAMING BEGIN 2 ===================================
 
@@ -439,26 +663,6 @@ static void stream_circle_task(void *pv)
 
 // =============================== TEST STREAMING END 2 ===================================
 
-
-// static uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
-//     uint16_t crc = 0xFFFF;
-//     for (size_t i=0;i<len;i++) {
-//         crc ^= (uint16_t)data[i] << 8;
-//         for (int b=0;b<8;b++)
-//             crc = (crc & 0x8000) ? (crc<<1) ^ 0x1021 : (crc<<1);
-//     }
-//     return crc;
-// }
-
-// static void stream_send_frame(uint8_t cmd, const uint8_t *payload, uint16_t len) {
-//     uint8_t hdr[6] = { STREAM_SYNC0, STREAM_SYNC1, cmd, (uint8_t)(len & 0xFF), (uint8_t)(len >> 8), 0x00 };
-//     // hdr[5] зарезервирован под версию или флаги, пока 0
-//     uart_write_bytes(STM32_UART_PORT, (const char*)hdr, sizeof(hdr));
-//     if (len && payload) uart_write_bytes(STM32_UART_PORT, (const char*)payload, len);
-//     uint16_t crc = crc16_ccitt(payload, len);
-//     uint8_t tail[2] = { (uint8_t)(crc>>8), (uint8_t)(crc & 0xFF) };
-//     uart_write_bytes(STM32_UART_PORT, (const char*)tail, sizeof(tail));
-// }
 
 void keypad_init(void) {
     // Настройка пинов строк как выходы
@@ -682,169 +886,6 @@ static void stream_send_circle(float cx_mm, float cy_mm, float R_mm,
     stream_send_frame(STREAM_CMD_START, NULL, 0);
 }
 
-void process_keypad_command(char key) {
-    printf("\n=== KEYPAD: Key '%c' pressed ===\n", key);
-    
-    char params[32];
-    
-    switch(key) {
-        case '1':
-            printf("KEYPAD: Starting calibration\n");
-            send_to_stm32_cmd(CMD_CALIBRATE, NULL);
-            break;
-            
-        case '2':
-            printf("KEYPAD: Starting homing\n");
-            send_to_stm32_cmd(CMD_HOME, NULL);
-            break;
-            
-        case '3':
-            printf("KEYPAD: Pen UP\n");
-            send_to_stm32_cmd(CMD_PEN_UP, NULL);
-            break;
-            
-        case '4':
-            printf("KEYPAD: Pen DOWN\n");
-            send_to_stm32_cmd(CMD_PEN_DOWN, NULL);
-            break;
-            
-        case '5':
-            printf("KEYPAD: Select color 0\n");
-            send_to_stm32_cmd(CMD_SET_COLOR, "C0");
-            break;
-            
-        case '6':
-            printf("KEYPAD: Select color 1\n");
-            send_to_stm32_cmd(CMD_SET_COLOR, "C1");
-            break;
-            
-        case '7':
-            printf("KEYPAD: Select color 2\n");
-            send_to_stm32_cmd(CMD_SET_COLOR, "C2");
-            break;
-            
-        case '8':
-            printf("KEYPAD: Select color 3\n");
-            send_to_stm32_cmd(CMD_SET_COLOR, "C3");
-            break;
-            
-        case '9':
-            printf("KEYPAD: Draw 10mm circle from current position\n");
-            draw_circle_from_current(10.0); // Функция ниже
-            break;
-            
-        case '0':
-        {
-            // Example: concentric circles by streaming ticks
-            // Make sure STM32 stream parser is ready before using this
-            const float margin_mm = 2.0f;
-            const float x_max = plotter.x_max;
-            const float y_max = plotter.y_max;
-            if (x_max <= 0 || y_max <= 0) {
-                send_to_stm32_cmd(CMD_GET_LIMITS, NULL);
-                printf("STREAM: no limits yet\n");
-                break;
-            }
-
-            float shorter = (x_max < y_max) ? x_max : y_max;
-            float base_D  = shorter - 2*margin_mm;
-            float cx = x_max * 0.5f, cy = y_max * 0.5f;
-
-            // pen-up, move to start of outer circle (text protocol still)
-            send_to_stm32_cmd(CMD_PEN_UP, NULL);
-            char p[64];
-            sprintf(p, "X%.2f,Y%.2f", cx + base_D*0.5f, cy);
-            send_to_stm32_cmd(CMD_G0_RAPID, p);
-
-            // Now stream 4 circles with D, 0.8D, 0.6D, 0.4D
-            const uint32_t f_hz = 10000;
-            const float v_mm_s  = 20.0f; // ~1200 mm/min
-
-            for (int i=0;i<4;i++) {
-                float D = base_D * (1.0f - 0.2f * i);
-                float R = 0.5f * D;
-
-                // set color via text protocol
-                char cbuf[8];
-                sprintf(cbuf, "C%u", (unsigned)i);
-                send_to_stm32_cmd(CMD_SET_COLOR, cbuf);
-                // lower pen
-                send_to_stm32_cmd(CMD_PEN_DOWN, NULL);
-
-                // stream circle
-                stream_send_circle(cx, cy, R, v_mm_s, f_hz);
-
-                // lift pen after playback (можно по завершению, когда добавим ACK)
-                send_to_stm32_cmd(CMD_PEN_UP, NULL);
-            }
-            break;
-        }
-
-//             printf("KEYPAD: Starting concentric circles task\n");
-//             // Создаём задачу если она не существует
-//             static TaskHandle_t circles_task = NULL;
-//             if (circles_task != NULL) {
-// printf("KEYPAD-0: 1\n");
-//                 vTaskDelete(circles_task);
-// printf("KEYPAD-0: 2\n");
-//                 circles_task = NULL;
-// printf("KEYPAD-0: 3\n");
-//                 vTaskDelay(pdMS_TO_TICKS(100));
-//             }
-//             xTaskCreate(draw_concentric_circles_task, "draw_circles", 
-//                        8192, NULL, 3, &circles_task);
-// printf("KEYPAD-0: 4\n");
-//             break;
-            
-        case 'A':
-        {
-            printf("KEYPAD: Stream circle\n");
-            static TaskHandle_t h = NULL;
-            if (h) { vTaskDelete(h); h = NULL; vTaskDelay(pdMS_TO_TICKS(50)); }
-            xTaskCreate(stream_circle_task, "stream_circle", 8192, NULL, 4, &h);
-            break;
-        }
-            // case 'A':
-        //     printf("KEYPAD: Move to (10,10)\n");
-        //     sprintf(params, "X10.00,Y10.00");
-        //     send_to_stm32_cmd(CMD_G0_RAPID, params);
-        //     break;
-            
-        case 'B':
-            printf("KEYPAD: Move to (20,10)\n");
-            sprintf(params, "X20.00,Y10.00");
-            send_to_stm32_cmd(CMD_G0_RAPID, params);
-            break;
-            
-        case 'C':
-            printf("KEYPAD: Move to (20,20)\n");
-            sprintf(params, "X20.00,Y20.00");
-            send_to_stm32_cmd(CMD_G0_RAPID, params);
-            break;
-            
-        case 'D':
-            printf("KEYPAD: Move to (10,20)\n");
-            sprintf(params, "X10.00,Y20.00");
-            send_to_stm32_cmd(CMD_G0_RAPID, params);
-            break;
-            
-        case '*':
-            printf("KEYPAD: Emergency STOP!\n");
-            send_to_stm32_cmd(CMD_EMERGENCY_STOP, NULL);
-            break;
-            
-        case '#':
-            printf("KEYPAD: Get status\n");
-            send_to_stm32_cmd(CMD_GET_STATUS, NULL);
-            send_to_stm32_cmd(CMD_GET_POSITION, NULL);
-            break;
-            
-        default:
-            printf("KEYPAD: Unknown key\n");
-            break;
-    }
-}
-
 // Display management
 void update_display() {
     if (xSemaphoreTake(display_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -921,7 +962,7 @@ uint32_t send_to_stm32_cmd(command_id_t cmd_id, const char* params) {
         plotter.current_cmd_status.cmd_state = CMD_NOT_PRESENTED;
     }
     
-    if (cmd_id != CMD_GET_CMD_STATUS)
+    if (cmd_id != CMD_GET_CMD_STATUS && cmd_id != CMD_GET_STATUS && cmd_id != CMD_HEARTBEAT)
         printf("-> STM32: %s", full_msg);
     
     uart_write_bytes(STM32_UART_PORT, full_msg, strlen(full_msg));
@@ -936,50 +977,38 @@ uint32_t send_to_stm32_cmd(command_id_t cmd_id, const char* params) {
 }
 
 void process_stm32_response(const char* response) {
-    // Проверка на отладочные сообщения ПЕРЕД парсингом
-    bool is_command = true;
-    if (strstr(response, "DEBUG:") || strstr(response, "EMERGENCY:") || 
-        strstr(response, "STM32") || strstr(response, "Z_CAL:") || 
-        strstr(response, "C_CAL:") || strstr(response, "AXIS_") ||
-        strstr(response, "MOVE_") || strstr(response, "says:") ||
-        strstr(response, "Color") || strstr(response, "Z:") ||
-        strstr(response, "C:")) {
-        // Это отладочное сообщение, не парсим как команду
-        printf("STM32 Debug: %s\n", response);
-        return;
-    }
-
-    // Parse: received_id:cmd_id:data or received_id:cmd_id
+    // Сначала пытаемся распарсить как команду
     uint32_t received_id;
     uint32_t cmd_id;
-    char data[256] = {0};  // Increased from 128
+    char data[256] = {0};
     
     int parsed = sscanf(response, "%lu:%lu:%255s", &received_id, &cmd_id, data);
     
-    if (parsed < 2) {
-        printf("Invalid response format\n");
-        return;
-    }
-
-    if (cmd_id != CMD_GET_CMD_STATUS)
+    // Если это валидный формат команды - обрабатываем
+    if (parsed >= 2 && received_id > 0 && cmd_id < CMD_COUNT) {
         printf("<- STM32: %s\n", response);
-    
-    switch (cmd_id) {
-        case CMD_HEARTBEAT:
-            plotter.last_heartbeat_received = xTaskGetTickCount();
-            plotter.heartbeat_ok = true;
-            plotter.is_connected = true;
-            break;
-            
+        
+        TickType_t now = xTaskGetTickCount();
+        plotter.last_rx_any = now;
+        
+        switch (cmd_id) {
+            case CMD_HEARTBEAT:
+                plotter.last_rx_heartbeat = now;
+                break;
+                
             case CMD_GET_STATUS:
-            if (strlen(data) >= 4) {
-                plotter.is_calibrated = (data[0] == '1');
-                plotter.is_homed = (data[1] == '1');
-                plotter.is_processing_cmd = (data[2] == '1');
-                plotter.is_idle = (data[3] == '1');
-            }
-            break;
-
+                printf("Processing CMD_GET_STATUS, data: %s\n", data);
+                if (strlen(data) >= 4) {
+                    plotter.is_calibrated = (data[0] == '1');
+                    plotter.is_homed = (data[1] == '1');
+                    plotter.is_processing_cmd = (data[2] == '1');
+                    plotter.is_idle = (data[3] == '1');
+                    printf("Status updated: cal=%d, home=%d, proc=%d, idle=%d\n",
+                           plotter.is_calibrated, plotter.is_homed,
+                           plotter.is_processing_cmd, plotter.is_idle);
+                }
+                break;
+                
             case CMD_GET_CMD_STATUS:
             {
                 uint32_t request_id = 0;
@@ -1019,72 +1048,76 @@ void process_stm32_response(const char* response) {
             }
             break;
             
-        case CMD_GET_LIMITS:
-            {
-                float x_mm, y_mm;
-                if (sscanf(data, "X%f,Y%f", &x_mm, &y_mm) == 2) {
-                    plotter.x_max = x_mm;
-                    plotter.y_max = y_mm;
-                    printf("Limits received: X=%.2f mm, Y=%.2f mm\n", x_mm, y_mm);
-                } else {
-                    printf("Failed to parse limits from: %s\n", data);
+            case CMD_GET_LIMITS:
+                {
+                    float x_mm, y_mm;
+                    if (sscanf(data, "X%f,Y%f", &x_mm, &y_mm) == 2) {
+                        plotter.x_max = x_mm;
+                        plotter.y_max = y_mm;
+                        printf("Limits received: X=%.2f mm, Y=%.2f mm\n", x_mm, y_mm);
+                    } else {
+                        printf("Failed to parse limits from: %s\n", data);
+                    }
                 }
+                break;
+                    
+            case CMD_GET_DIAGNOSTICS: {
+                int pen_state;
+                sscanf(data, "PEN:%d,FEED:%hu,SF:%f", 
+                    &pen_state, &plotter.feedrate, &plotter.speed_factor);
+                plotter.pen_is_down = (pen_state == 1);
+                break;
             }
-            break;
                 
-        case CMD_GET_DIAGNOSTICS: {
-            int pen_state;
-            sscanf(data, "PEN:%d,FEED:%hu,SF:%f", 
-                   &pen_state, &plotter.feedrate, &plotter.speed_factor);
-            plotter.pen_is_down = (pen_state == 1);
-            break;
-        }
-            
-        case CMD_GET_COLOR:
-            sscanf(data, "C%hhu:%15s", &plotter.current_color, plotter.color_name);
-            break;
-            
-        case CMD_CALIBRATE:
-        case CMD_HOME:
-        case CMD_G28_HOME:
-        case CMD_EMERGENCY_STOP:
-        case CMD_M112_EMERGENCY:
-        case CMD_MOVE_TO:
-        case CMD_G0_RAPID:
-        case CMD_G1_LINEAR:
-        case CMD_SET_SPEED:
-        case CMD_M220_SPEED_FACTOR:
-        case CMD_SET_ORIGIN:
-        case CMD_RESET_SYSTEM:
-        case CMD_PEN_UP:
-        case CMD_PEN_DOWN:
-        case CMD_SET_PEN:
-        case CMD_SET_COLOR: {
-            // Command acknowledged - check response
-            if (strcmp(data, "OK") == 0) {
-                printf("Command %s started\n", command_names[cmd_id]);
-            } else if (strcmp(data, "DONE") == 0) {
-                printf("Command %s completed\n", command_names[cmd_id]);
-                // Обновляем статус команды на FINISHED
-                if (plotter.current_cmd_status.request_id == received_id) {
-                    plotter.current_cmd_status.cmd_state = CMD_FINISHED;
+            case CMD_GET_COLOR:
+                sscanf(data, "C%hhu:%15s", &plotter.current_color, plotter.color_name);
+                break;
+                
+            case CMD_CALIBRATE:
+            case CMD_HOME:
+            case CMD_G28_HOME:
+            case CMD_EMERGENCY_STOP:
+            case CMD_M112_EMERGENCY:
+            case CMD_MOVE_TO:
+            case CMD_G0_RAPID:
+            case CMD_G1_LINEAR:
+            case CMD_SET_SPEED:
+            case CMD_M220_SPEED_FACTOR:
+            case CMD_SET_ORIGIN:
+            case CMD_RESET_SYSTEM:
+            case CMD_PEN_UP:
+            case CMD_PEN_DOWN:
+            case CMD_SET_PEN:
+            case CMD_SET_COLOR: {
+                // Command acknowledged - check response
+                if (strcmp(data, "OK") == 0) {
+                    printf("Command %s started\n", command_names[cmd_id]);
+                } else if (strcmp(data, "DONE") == 0) {
+                    printf("Command %s completed\n", command_names[cmd_id]);
+                    // Обновляем статус команды на FINISHED
+                    if (plotter.current_cmd_status.request_id == received_id) {
+                        plotter.current_cmd_status.cmd_state = CMD_FINISHED;
+                    }
+                } else if (strncmp(data, "ERROR", 5) == 0) {
+                    printf("Command %s failed: %s\n", command_names[cmd_id], data);
+                    if (plotter.current_cmd_status.request_id == received_id) {
+                        plotter.current_cmd_status.cmd_state = CMD_FAILED;
+                    }
+                } else if (strcmp(data, "BUSY") == 0) {
+                    printf("Command %s rejected - system busy\n", command_names[cmd_id]);
                 }
-            } else if (strncmp(data, "ERROR", 5) == 0) {
-                printf("Command %s failed: %s\n", command_names[cmd_id], data);
-                if (plotter.current_cmd_status.request_id == received_id) {
-                    plotter.current_cmd_status.cmd_state = CMD_FAILED;
-                }
-            } else if (strcmp(data, "BUSY") == 0) {
-                printf("Command %s rejected - system busy\n", command_names[cmd_id]);
+                break;
             }
-            break;
+                
+            default:
+                printf("Unknown cmd_id: %lu\n", cmd_id);
+                break;
         }
-            
-        default:
-            printf("Unknown cmd_id: %lu\n", cmd_id);
-            break;
     }
-    
+    else {
+        // Это отладочное сообщение
+        printf("------- %s\n", response);
+    }
     plotter.is_connected = true;
 }
 
@@ -1092,10 +1125,9 @@ void process_stm32_response(const char* response) {
 void stm32_uart_task(void *pvParameters) {
     char buffer[512];
     int pos = 0;
+    uint8_t binary_state = 0;
     
-    printf("STM32 UART task started\n");
-    
-    // Flush any pending data
+    printf("STM32 UART task started (with stream request support)\n");
     uart_flush(STM32_UART_PORT);
     
     while (1) {
@@ -1103,120 +1135,102 @@ void stm32_uart_task(void *pvParameters) {
         int len = uart_read_bytes(STM32_UART_PORT, &data, 1, pdMS_TO_TICKS(10));
         
         if (len > 0) {
-            // Проверяем на бинарные данные от STM32 (например, ответы на STREAM команды)
-            // STM32 может отправлять "STREAM: ..." сообщения
+            // Check for binary stream request
+            if (data == STREAM_SYNC0 && binary_state == 0) {
+                binary_state = 1;
+                continue;
+            } else if (binary_state == 1) {
+                if (data == STREAM_SYNC1) {
+                    // Read command byte
+                    uint8_t cmd;
+                    uart_read_bytes(STM32_UART_PORT, &cmd, 1, pdMS_TO_TICKS(100));
+                    
+                    if (cmd == STREAM_CMD_REQUEST_MORE) {
+                        // Read payload length (2 bytes)
+                        uint8_t len_bytes[2];
+                        uart_read_bytes(STM32_UART_PORT, len_bytes, 2, pdMS_TO_TICKS(100));
+                        uint16_t payload_len = len_bytes[0] | (len_bytes[1] << 8);
+                        
+                        // Read requested size
+                        if (payload_len == 2) {
+                            uint8_t size_bytes[2];
+                            uart_read_bytes(STM32_UART_PORT, size_bytes, 2, pdMS_TO_TICKS(100));
+                            uint16_t requested = size_bytes[0] | (size_bytes[1] << 8);
+                            
+                            // Skip CRC byte
+                            uint8_t dummy;
+                            uart_read_bytes(STM32_UART_PORT, &dummy, 1, pdMS_TO_TICKS(100));
+                            
+                            // Handle request
+                            handle_stream_request(requested);
+                        }
+                    }
+                    binary_state = 0;
+                    continue;
+                } else {
+                    binary_state = 0;
+                    // Process the SYNC0 and current byte as normal text
+                }
+            }
             
+            // Normal text processing
             if (data == '\n' || data == '\r') {
                 if (pos > 0) {
                     buffer[pos] = '\0';
-                    
-                    // Проверяем, не является ли это отладочным сообщением о STREAM
-                    if (strstr(buffer, "STREAM:") || 
-                        strstr(buffer, "SELFTEST:") ||
-                        strstr(buffer, "DEBUG:")) {
-                        // Это отладочное сообщение, просто выводим
-                        printf("STM32: %s\n", buffer);
-                    } else if (strstr(buffer, "Invalid format") || 
-                               strstr(buffer, "Invalid response format")) {
-                        // Игнорируем ошибки парсинга от предыдущих попыток
-                        // Не выводим, чтобы не засорять лог
-                    } else {
-                        // Обычное сообщение-ответ
-                        process_stm32_response(buffer);
-                    }
+                    process_stm32_response(buffer);
                     pos = 0;
                 }
             } else if (pos < sizeof(buffer) - 1) {
-                // Фильтруем непечатаемые символы кроме специальных
                 if (data >= 32 || data == '\t') {
                     buffer[pos++] = data;
                 }
             } else {
-                // Буфер переполнен, сбрасываем
                 pos = 0;
             }
         }
         
-        // Prevent task starvation
         taskYIELD();
     }
 }
 
-// Main control task
-// void plotter_control_task(void *pvParameters) {
-//     printf("Plotter control task started\n");
+void start_continuous_spiral(void) {
+    printf("Starting continuous spiral streaming\n");
     
-//     vTaskDelay(pdMS_TO_TICKS(500));
+    // Initialize
+    continuous_stream_init();
     
-//     send_to_stm32_cmd(CMD_HEARTBEAT, NULL);
-//     plotter.last_heartbeat_sent = xTaskGetTickCount();
+    // Send BEGIN with continuous flag
+    uint8_t begin_payload[10];
+    uint32_t f_hz = STREAM_F_HZ;
+    begin_payload[0] = (uint8_t)(f_hz & 0xFF);
+    begin_payload[1] = (uint8_t)((f_hz >> 8) & 0xFF);
+    begin_payload[2] = (uint8_t)((f_hz >> 16) & 0xFF);
+    begin_payload[3] = (uint8_t)((f_hz >> 24) & 0xFF);
+    begin_payload[4] = (uint8_t)(STREAM_STEP_US & 0xFF);
+    begin_payload[5] = (uint8_t)(STREAM_STEP_US >> 8);
+    begin_payload[6] = (uint8_t)(STREAM_GUARD_US & 0xFF);
+    begin_payload[7] = (uint8_t)(STREAM_GUARD_US >> 8);
+    begin_payload[8] = STREAM_INV_MASK;
+    begin_payload[9] = 0xFF;  // Magic byte for continuous mode
     
-//     // Счетчик неответов для диагностики
-//     //uint32_t no_response_counter = 0;
-//     //uint32_t last_response_time = xTaskGetTickCount();
+    stream_send_frame(STREAM_CMD_BEGIN, begin_payload, 10);
     
-//     while (1) {
-//         uint32_t current_time = xTaskGetTickCount();
-        
-//         // 1. Heartbeat every 2 seconds
-//         if (current_time - plotter.last_heartbeat_sent > pdMS_TO_TICKS(2000)) {
-//             send_to_stm32_cmd(CMD_HEARTBEAT, NULL);
-//             plotter.last_heartbeat_sent = current_time;
-            
-//             if (current_time - plotter.last_heartbeat_received > pdMS_TO_TICKS(5000)) {
-//                 plotter.heartbeat_ok = false;
-//                 plotter.is_connected = false;
-//             }
-//         }
-        
-//         // Only proceed if connected
-//         if (!plotter.is_connected) {
-//             vTaskDelay(pdMS_TO_TICKS(100));
-//             continue;
-//         }
-        
-//         // 2. Request status
-//         if (current_time - plotter.last_status_request > pdMS_TO_TICKS(500)) {
-//             send_to_stm32_cmd(CMD_GET_STATUS, NULL);
-//             plotter.last_status_request = current_time;
-//         }
-        
-//         // 3. Request position
-//         if (current_time - plotter.last_position_request > pdMS_TO_TICKS(750)) {
-//             send_to_stm32_cmd(CMD_GET_POSITION, NULL);
-//             plotter.last_position_request = current_time;
-//         }
-        
-//         // 4. Request limits if not known
-//         static bool limits_requested = false;
-//         if (!limits_requested && plotter.is_calibrated) {
-//             send_to_stm32_cmd(CMD_GET_LIMITS, NULL);
-//             limits_requested = true;
-//         }
-        
-//         // 5. Auto-calibration if not calibrated
-//         if (plotter.is_connected && !plotter.is_calibrated && !plotter.is_processing_cmd) {
-//             static uint32_t last_calib_request = 0;
-//             if (current_time - last_calib_request > pdMS_TO_TICKS(5000)) {
-//                 printf("Starting auto-calibration...\n");
-//                 send_to_stm32_cmd(CMD_CALIBRATE, NULL);
-//                 last_calib_request = current_time;
-//             }
-//         }
+    // Start generator task
+    xTaskCreate(continuous_spiral_generator, "spiral_gen", 4096, NULL, 5, &cont_stream.generator_task);
+    
+    // Wait a bit for initial data generation
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // Send initial chunk
+    handle_stream_request(CONTINUOUS_CHUNK_SIZE);
+    
+    // Send START command
+    stream_send_frame(STREAM_CMD_START, NULL, 0);
+    
+    printf("Continuous streaming started\n");
+}
 
-//         // 6. Auto-homing if calibrated but not homed
-//         if (plotter.is_connected && plotter.is_calibrated && !plotter.is_homed && !plotter.is_processing_cmd) {
-//             static uint32_t last_home_request = 0;
-//             if (current_time - last_home_request > pdMS_TO_TICKS(2000)) {
-//                 printf("Starting auto-homing...\n");
-//                 send_to_stm32_cmd(CMD_HOME, NULL);
-//                 last_home_request = current_time;
-//             }
-//         }
-        
-//         vTaskDelay(pdMS_TO_TICKS(100));
-//     }
-// }
+// ================================ STREAMING FNCs END =============================
 
 void plotter_control_task(void *pvParameters) {
     printf("Plotter control task started\n");
@@ -1227,41 +1241,36 @@ void plotter_control_task(void *pvParameters) {
     plotter.last_heartbeat_sent = xTaskGetTickCount();
     
     while (1) {
-        uint32_t current_time = xTaskGetTickCount();
-        
-        // 1. Heartbeat every 2 seconds
-        // if (current_time - plotter.last_heartbeat_sent > pdMS_TO_TICKS(2000)) {
-        //     send_to_stm32_cmd(CMD_HEARTBEAT, NULL);
-        //     plotter.last_heartbeat_sent = current_time;
-            
-        //     if (current_time - plotter.last_heartbeat_received > pdMS_TO_TICKS(5000)) {
-        //         plotter.heartbeat_ok = false;
-        //         plotter.is_connected = false;
-        //     }
-        // }
-        
-        // Only proceed if connected
-        if (!plotter.is_connected) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
+        // Поддержка связи: периодические отправки
+        TickType_t now = xTaskGetTickCount();
+
+        // HEARTBEAT раз в секунду
+        if ((now - plotter.last_heartbeat_sent) >= pdMS_TO_TICKS(HEARTBEAT_PERIOD_MS)) {
+            send_to_stm32_cmd(CMD_HEARTBEAT, NULL);
+            plotter.last_heartbeat_sent = now;
         }
-        
-        // // 2. Request status
-        // if (current_time - plotter.last_status_request > pdMS_TO_TICKS(500)) {
-        //     send_to_stm32_cmd(CMD_GET_STATUS, NULL);
-        //     plotter.last_status_request = current_time;
-        // }
-        
-        // // 3. Request position
-        // if (current_time - plotter.last_position_request > pdMS_TO_TICKS(750)) {
-        //     send_to_stm32_cmd(CMD_GET_POSITION, NULL);
-        //     plotter.last_position_request = current_time;
-        // }
-        
-        // УБРАЛИ автоматическую калибровку и homing
-        // Теперь всё управляется с клавиатуры
-        
-        vTaskDelay(pdMS_TO_TICKS(100));
+
+        // Запрос статуса раз в секунду
+        if ((now - plotter.last_status_request) >= pdMS_TO_TICKS(1000)) {
+            send_to_stm32_cmd(CMD_GET_STATUS, NULL);
+            plotter.last_status_request = now;
+        }
+
+        // Watchdog связи: если давно не было ответов — считаем, что отключились
+        TickType_t last_alive = (plotter.last_rx_heartbeat > plotter.last_rx_any)
+                                ? plotter.last_rx_heartbeat
+                                : plotter.last_rx_any;
+
+        bool prev_connected = plotter.is_connected;
+        plotter.is_connected = (last_alive != 0) &&
+                            ((now - last_alive) <= pdMS_TO_TICKS(CONNECT_TIMEOUT_MS));
+
+        // (опционально) логируем только смену состояния
+        if (prev_connected != plotter.is_connected) {
+            printf("[link] is_connected = %s\n", plotter.is_connected ? "true" : "false");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));    
     }
 }
 
@@ -1545,6 +1554,171 @@ void test_simple_move(void) {
     printf("TEST: Complete\n");
 }
 
+void process_keypad_command(char key) {
+    printf("\n=== KEYPAD: Key '%c' pressed ===\n", key);
+    
+    char params[32];
+    
+    switch(key) {
+        case '1':
+            printf("KEYPAD: Starting calibration\n");
+            send_to_stm32_cmd(CMD_CALIBRATE, NULL);
+            break;
+            
+        case '2':
+            printf("KEYPAD: Starting homing\n");
+            send_to_stm32_cmd(CMD_HOME, NULL);
+            break;
+            
+        case '3':
+            printf("KEYPAD: Pen UP\n");
+            send_to_stm32_cmd(CMD_PEN_UP, NULL);
+            break;
+            
+        case '4':
+            printf("KEYPAD: Pen DOWN\n");
+            send_to_stm32_cmd(CMD_PEN_DOWN, NULL);
+            break;
+            
+        case '5':
+            printf("KEYPAD: Select color 0\n");
+            send_to_stm32_cmd(CMD_SET_COLOR, "C0");
+            break;
+            
+        case '6':
+            printf("KEYPAD: Select color 1\n");
+            send_to_stm32_cmd(CMD_SET_COLOR, "C1");
+            break;
+            
+        case '7':
+            printf("KEYPAD: Select color 2\n");
+            send_to_stm32_cmd(CMD_SET_COLOR, "C2");
+            break;
+            
+        case '8':
+            printf("KEYPAD: Select color 3\n");
+            send_to_stm32_cmd(CMD_SET_COLOR, "C3");
+            break;
+            
+        case '9':
+            printf("KEYPAD: Draw 10mm circle from current position\n");
+            draw_circle_from_current(10.0); // Функция ниже
+            break;
+            
+        case '0':
+        {
+            // Example: concentric circles by streaming ticks
+            // Make sure STM32 stream parser is ready before using this
+            const float margin_mm = 2.0f;
+            const float x_max = plotter.x_max;
+            const float y_max = plotter.y_max;
+            if (x_max <= 0 || y_max <= 0) {
+                send_to_stm32_cmd(CMD_GET_LIMITS, NULL);
+                printf("STREAM: no limits yet\n");
+                break;
+            }
+
+            float shorter = (x_max < y_max) ? x_max : y_max;
+            float base_D  = shorter - 2*margin_mm;
+            float cx = x_max * 0.5f, cy = y_max * 0.5f;
+
+            // pen-up, move to start of outer circle (text protocol still)
+            send_to_stm32_cmd(CMD_PEN_UP, NULL);
+            char p[64];
+            sprintf(p, "X%.2f,Y%.2f", cx + base_D*0.5f, cy);
+            send_to_stm32_cmd(CMD_G0_RAPID, p);
+
+            // Now stream 4 circles with D, 0.8D, 0.6D, 0.4D
+            const uint32_t f_hz = 10000;
+            const float v_mm_s  = 20.0f; // ~1200 mm/min
+
+            for (int i=0;i<4;i++) {
+                float D = base_D * (1.0f - 0.2f * i);
+                float R = 0.5f * D;
+
+                // set color via text protocol
+                char cbuf[8];
+                sprintf(cbuf, "C%u", (unsigned)i);
+                send_to_stm32_cmd(CMD_SET_COLOR, cbuf);
+                // lower pen
+                send_to_stm32_cmd(CMD_PEN_DOWN, NULL);
+
+                // stream circle
+                stream_send_circle(cx, cy, R, v_mm_s, f_hz);
+
+                // lift pen after playback (можно по завершению, когда добавим ACK)
+                send_to_stm32_cmd(CMD_PEN_UP, NULL);
+            }
+            break;
+        }
+
+        case 'A':  // Start continuous spiral
+        {
+            printf("KEYPAD: Starting continuous spiral stream\n");
+            
+            // Ensure we're homed first
+            if (!plotter.is_homed) {
+                printf("ERROR: Not homed, please home first\n");
+                break;
+            }
+            
+            // Get limits if needed
+            if (plotter.x_max == 0.0f || plotter.y_max == 0.0f) {
+                send_to_stm32_cmd(CMD_GET_LIMITS, NULL);
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+            
+            // Start continuous streaming
+            start_continuous_spiral();
+            break;
+        }
+        
+        case 'B':  // Stop continuous streaming
+        {
+            printf("KEYPAD: Stopping continuous stream\n");
+            
+            // Send END signal
+            stream_send_frame(STREAM_CMD_END, NULL, 0);
+            
+            // Clean up
+            continuous_stream_cleanup();
+            
+            // Send ABORT just to be safe
+            stream_send_frame(STREAM_CMD_ABORT, NULL, 0);
+            
+            printf("Continuous streaming stopped\n");
+            break;
+        }
+                    
+        case 'C':
+            printf("KEYPAD: Move to (20,20)\n");
+            sprintf(params, "X20.00,Y20.00");
+            send_to_stm32_cmd(CMD_G0_RAPID, params);
+            break;
+            
+        case 'D':
+            printf("KEYPAD: Move to (10,20)\n");
+            sprintf(params, "X10.00,Y20.00");
+            send_to_stm32_cmd(CMD_G0_RAPID, params);
+            break;
+            
+        case '*':
+            printf("KEYPAD: Emergency STOP!\n");
+            send_to_stm32_cmd(CMD_EMERGENCY_STOP, NULL);
+            break;
+            
+        case '#':
+            printf("KEYPAD: Get status\n");
+            send_to_stm32_cmd(CMD_GET_STATUS, NULL);
+            send_to_stm32_cmd(CMD_GET_POSITION, NULL);
+            break;
+            
+        default:
+            printf("KEYPAD: Unknown key\n");
+            break;
+    }
+}
+
 void app_main() {
     printf("ESP32 Plotter Bridge Starting\n");
     
@@ -1553,9 +1727,6 @@ void app_main() {
     
     // Initialize state
     plotter.last_heartbeat_sent = 0;
-    plotter.last_heartbeat_received = 0;
-    plotter.last_status_request = 0;
-    plotter.last_position_request = 0;
     strcpy(plotter.last_command, "None");
     strcpy(plotter.status_text, "Initializing");
     
@@ -1622,3 +1793,5 @@ void app_main() {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
+
+// idf.py -p /dev/ttyUSB0 -b 115200 flash monitor
