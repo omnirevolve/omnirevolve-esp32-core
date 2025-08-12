@@ -117,7 +117,7 @@ static uint8_t stream_pkt[STREAM_PKT_BYTES];
 
 // GPIO пины для клавиатуры (можно изменить под вашу схему)
 static const int row_pins[KEYPAD_ROWS] = {32, 33, 27, 2}; // Выходы (строки)
-static const int col_pins[KEYPAD_COLS] = {12, 13, 15, 4};  // Входы (столбцы)
+static const int col_pins[KEYPAD_COLS] = {22, 21, 19, 4};  // Входы (столбцы)
 
 // Матрица символов клавиатуры
 static const char keypad_keys[KEYPAD_ROWS][KEYPAD_COLS] = {
@@ -147,6 +147,10 @@ typedef struct {
     TaskHandle_t sender_task;
     SemaphoreHandle_t buffer_mutex;
     SemaphoreHandle_t data_ready_sem;
+    
+    uint8_t stream_ending;      // Флаг завершения потока
+    uint8_t request_pending;    // Флаг ожидания запроса
+    uint8_t continuous_mode;    // Флаг непрерывного режима    
 } continuous_stream_t;
 
 static continuous_stream_t cont_stream = {0};
@@ -473,6 +477,9 @@ static void continuous_stream_init(void) {
     cont_stream.total_generated = 0;
     cont_stream.generation_complete = 0;
     cont_stream.active = 1;
+    cont_stream.stream_ending = 0;
+    cont_stream.request_pending = 0;
+    cont_stream.continuous_mode = 1;  // Устанавливаем режим
     
     if (!cont_stream.buffer_mutex) {
         cont_stream.buffer_mutex = xSemaphoreCreateMutex();
@@ -486,19 +493,41 @@ static void continuous_stream_init(void) {
 static void continuous_stream_cleanup(void) {
     cont_stream.active = 0;
     
+    // Даем время задаче завершиться самостоятельно
     if (cont_stream.generator_task) {
-        vTaskDelete(cont_stream.generator_task);
+        // Ждем, пока задача сама завершится
+        vTaskDelay(pdMS_TO_TICKS(100));
+        
+        // Проверяем, удалилась ли задача сама
+        if (cont_stream.generator_task) {
+            vTaskDelete(cont_stream.generator_task);
+        }
         cont_stream.generator_task = NULL;
     }
+    
     if (cont_stream.sender_task) {
         vTaskDelete(cont_stream.sender_task);
         cont_stream.sender_task = NULL;
     }
     
+    // Очищаем буфер после небольшой задержки
+    vTaskDelay(pdMS_TO_TICKS(50));
+    
     if (cont_stream.buffer) {
         free(cont_stream.buffer);
         cont_stream.buffer = NULL;
     }
+    
+    // Сбрасываем все поля структуры
+    cont_stream.buffer_size = 0;
+    cont_stream.write_pos = 0;
+    cont_stream.read_pos = 0;
+    cont_stream.total_sent = 0;
+    cont_stream.total_generated = 0;
+    cont_stream.generation_complete = 0;
+    cont_stream.stream_ending = 0;
+    cont_stream.request_pending = 0;
+    cont_stream.continuous_mode = 0;
 }
 
 // Generate continuous pattern (example: spiral)
@@ -600,68 +629,186 @@ static void continuous_spiral_generator(void *pvParams) {
     
     cont_stream.generation_complete = 1;
     printf("SPIRAL: Generation complete, total bytes: %zu\n", cont_stream.total_generated);
-    vTaskDelete(NULL);
+
+    // Безопасное завершение
+    xSemaphoreTake(cont_stream.buffer_mutex, portMAX_DELAY);
+    TaskHandle_t temp_handle = cont_stream.generator_task;
+    cont_stream.generator_task = NULL;  // Сбрасываем handle ДО удаления
+    xSemaphoreGive(cont_stream.buffer_mutex);
+    
+    vTaskDelete(temp_handle ? temp_handle : NULL);  // Удаляем себя через сохраненный handle
 }
 
-// Handle data request from STM32
 static void handle_stream_request(uint16_t requested_bytes) {
     if (!cont_stream.active) return;
-    
+
     printf("STREAM_REQ: STM32 requested %u bytes\n", requested_bytes);
-    
+
     xSemaphoreTake(cont_stream.buffer_mutex, portMAX_DELAY);
-    
+
     size_t available = (cont_stream.write_pos >= cont_stream.read_pos) ?
-                      (cont_stream.write_pos - cont_stream.read_pos) :
-                      (CONTINUOUS_BUFFER_SIZE - cont_stream.read_pos + cont_stream.write_pos);
-    
-    size_t to_send = (available < requested_bytes) ? available : requested_bytes;
-    
-    if (to_send > 0) {
-        // Send data in chunks
-        uint8_t chunk[CONTINUOUS_CHUNK_SIZE];
-        size_t sent = 0;
-        
-        while (sent < to_send) {
-            size_t chunk_size = (to_send - sent < CONTINUOUS_CHUNK_SIZE) ? 
-                               (to_send - sent) : CONTINUOUS_CHUNK_SIZE;
+                       (cont_stream.write_pos - cont_stream.read_pos) :
+                       (CONTINUOUS_BUFFER_SIZE - cont_stream.read_pos + cont_stream.write_pos);
+
+    if (available == 0) {
+        if (cont_stream.generation_complete && !cont_stream.stream_ending) {
+            // Отправляем END с правильным CRC
+            cont_stream.stream_ending = 1;  // Устанавливаем флаг
             
-            // Copy from circular buffer
-            for (size_t i = 0; i < chunk_size; i++) {
-                chunk[i] = cont_stream.buffer[cont_stream.read_pos];
-                cont_stream.read_pos = (cont_stream.read_pos + 1) % CONTINUOUS_BUFFER_SIZE;
-            }
+            // Формируем бинарный кадр END
+            uint8_t end_frame[7];
+            end_frame[0] = STREAM_SYNC0;
+            end_frame[1] = STREAM_SYNC1;
+            end_frame[2] = STREAM_CMD_END;
+            end_frame[3] = 0x00;  // Len low
+            end_frame[4] = 0x00;  // Len high
             
-            // Send DATA frame
-            stream_send_frame(STREAM_CMD_DATA, chunk, chunk_size);
-            sent += chunk_size;
-            cont_stream.total_sent += chunk_size;
+            // CRC для пустого payload
+            uint16_t crc = 0xFFFF;
+            end_frame[5] = (uint8_t)(crc >> 8);   // CRC hi
+            end_frame[6] = (uint8_t)(crc & 0xFF); // CRC lo
+            
+            xSemaphoreGive(cont_stream.buffer_mutex);
+            
+            // Отправляем бинарный кадр
+            uart_write_bytes(STM32_UART_PORT, (const char*)end_frame, 7);
+            uart_wait_tx_done(STM32_UART_PORT, pdMS_TO_TICKS(100));
+            
+            printf("STREAM_REQ: Sent END signal (no data, generation complete)\n");
+            
+            // Задержка перед cleanup
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continuous_stream_cleanup();
+            return;
+        } else {
+            printf("STREAM_REQ: No data available yet\n");
+            cont_stream.request_pending = 0;  // Сбрасываем флаг
+            xSemaphoreGive(cont_stream.buffer_mutex);
+            return;
         }
-        
-        printf("STREAM_REQ: Sent %zu bytes (total: %zu)\n", sent, cont_stream.total_sent);
-    } else if (cont_stream.generation_complete) {
-        // No more data and generation complete - send END
-        stream_send_frame(STREAM_CMD_END, NULL, 0);
-        printf("STREAM_REQ: Sent END signal\n");
-        continuous_stream_cleanup();
-    } else {
-        printf("STREAM_REQ: No data available yet\n");
     }
-    
+
+    // Есть что отправлять
+    size_t to_send = (available < requested_bytes) ? available : requested_bytes;
+
+    uint8_t *chunk = malloc(CONTINUOUS_CHUNK_SIZE);
+    if (chunk == NULL) {
+        printf("STREAM_REQ: ERROR - malloc failed for chunk!\n");
+        xSemaphoreGive(cont_stream.buffer_mutex);
+        return;
+    }
+
+    size_t sent = 0;
+    while (sent < to_send) {
+        size_t chunk_size = ((to_send - sent) < CONTINUOUS_CHUNK_SIZE) ?
+                            (to_send - sent) : CONTINUOUS_CHUNK_SIZE;
+
+        for (size_t i = 0; i < chunk_size; i++) {
+            chunk[i] = cont_stream.buffer[cont_stream.read_pos];
+            cont_stream.read_pos = (cont_stream.read_pos + 1) % CONTINUOUS_BUFFER_SIZE;
+        }
+
+        stream_send_frame(STREAM_CMD_DATA, chunk, chunk_size);
+        sent += chunk_size;
+        cont_stream.total_sent += chunk_size;
+    }
+
+    printf("STREAM_REQ: Sent %zu bytes (total: %zu)\n", sent, cont_stream.total_sent);
+    free(chunk);
+
+    // Проверяем, нужно ли отправить END
+    size_t available_after = (cont_stream.write_pos >= cont_stream.read_pos) ?
+                             (cont_stream.write_pos - cont_stream.read_pos) :
+                             (CONTINUOUS_BUFFER_SIZE - cont_stream.read_pos + cont_stream.write_pos);
+
+    bool partial_fulfill = (sent < (size_t)requested_bytes);
+    if ((partial_fulfill || available_after == 0) && cont_stream.generation_complete && !cont_stream.stream_ending) {
+        cont_stream.stream_ending = 1;
+        
+        // Отправляем END
+        uint8_t end_frame[7];
+        end_frame[0] = STREAM_SYNC0;
+        end_frame[1] = STREAM_SYNC1;
+        end_frame[2] = STREAM_CMD_END;
+        end_frame[3] = 0x00;
+        end_frame[4] = 0x00;
+        uint16_t crc = 0xFFFF;
+        end_frame[5] = (uint8_t)(crc >> 8);
+        end_frame[6] = (uint8_t)(crc & 0xFF);
+        
+        xSemaphoreGive(cont_stream.buffer_mutex);
+        
+        uart_write_bytes(STM32_UART_PORT, (const char*)end_frame, 7);
+        uart_wait_tx_done(STM32_UART_PORT, pdMS_TO_TICKS(100));
+        
+        printf("STREAM_REQ: Sent END signal\n");
+        
+        vTaskDelay(pdMS_TO_TICKS(100));
+        continuous_stream_cleanup();
+        return;
+    }
+
+    cont_stream.request_pending = 0;  // Сбрасываем флаг запроса
     xSemaphoreGive(cont_stream.buffer_mutex);
 }
 
-// =============================== TEST STREAMING BEGIN 2 ===================================
+// // Handle data request from STM32
+// static void handle_stream_request(uint16_t requested_bytes) {
+//     if (!cont_stream.active) return;
+    
+//     printf("STREAM_REQ: STM32 requested %u bytes\n", requested_bytes);
+    
+//     xSemaphoreTake(cont_stream.buffer_mutex, portMAX_DELAY);
+    
+//     size_t available = (cont_stream.write_pos >= cont_stream.read_pos) ?
+//                       (cont_stream.write_pos - cont_stream.read_pos) :
+//                       (CONTINUOUS_BUFFER_SIZE - cont_stream.read_pos + cont_stream.write_pos);
+    
+//     size_t to_send = (available < requested_bytes) ? available : requested_bytes;
+    
+//     if (to_send > 0) {
+//         // Allocate chunk on heap instead of stack to prevent overflow
+//         uint8_t *chunk = malloc(CONTINUOUS_CHUNK_SIZE);
+//         if (chunk == NULL) {
+//             printf("STREAM_REQ: ERROR - malloc failed for chunk!\n");
+//             xSemaphoreGive(cont_stream.buffer_mutex);
+//             return;
+//         }
+        
+//         size_t sent = 0;
+        
+//         while (sent < to_send) {
+//             size_t chunk_size = (to_send - sent < CONTINUOUS_CHUNK_SIZE) ? 
+//                                (to_send - sent) : CONTINUOUS_CHUNK_SIZE;
+            
+//             // Copy from circular buffer
+//             for (size_t i = 0; i < chunk_size; i++) {
+//                 chunk[i] = cont_stream.buffer[cont_stream.read_pos];
+//                 cont_stream.read_pos = (cont_stream.read_pos + 1) % CONTINUOUS_BUFFER_SIZE;
+//             }
+            
+//             // Send DATA frame
+//             stream_send_frame(STREAM_CMD_DATA, chunk, chunk_size);
+//             sent += chunk_size;
+//             cont_stream.total_sent += chunk_size;
+//         }
+        
+//         printf("STREAM_REQ: Sent %zu bytes (total: %zu)\n", sent, cont_stream.total_sent);
+        
+//         free(chunk);  // Free the allocated chunk
+//     } else if (cont_stream.generation_complete) {
+//         // No more data and generation complete - send END
+//         stream_send_frame(STREAM_CMD_END, NULL, 0);
+//         printf("STREAM_REQ: Sent END signal\n");
+//         continuous_stream_cleanup();
+//     } else {
+//         printf("STREAM_REQ: No data available yet\n");
+//     }
+    
+//     xSemaphoreGive(cont_stream.buffer_mutex);
+// }
 
-// =============================== TEST STREAMING END 2 ===================================
-
-// =============================== TEST STREAMING BEGIN 2 ===================================
-
-// =============================== TEST STREAMING END 2 ===================================
-
-// =============================== TEST STREAMING BEGIN 2 ===================================
-
-// =============================== TEST STREAMING END 2 ===================================
+// ===============================
 
 
 void keypad_init(void) {
@@ -986,8 +1133,9 @@ void process_stm32_response(const char* response) {
     
     // Если это валидный формат команды - обрабатываем
     if (parsed >= 2 && received_id > 0 && cmd_id < CMD_COUNT) {
-        printf("<- STM32: %s\n", response);
-        
+        if (cmd_id != CMD_GET_CMD_STATUS && cmd_id != CMD_GET_STATUS && cmd_id != CMD_HEARTBEAT)
+            printf("<- STM32: %s\n", response);
+            
         TickType_t now = xTaskGetTickCount();
         plotter.last_rx_any = now;
         
@@ -997,6 +1145,7 @@ void process_stm32_response(const char* response) {
                 break;
                 
             case CMD_GET_STATUS:
+                
                 printf("Processing CMD_GET_STATUS, data: %s\n", data);
                 if (strlen(data) >= 4) {
                     plotter.is_calibrated = (data[0] == '1');
@@ -1121,62 +1270,146 @@ void process_stm32_response(const char* response) {
     plotter.is_connected = true;
 }
 
-// UART communication task
-void stm32_uart_task(void *pvParameters) {
-    char buffer[512];
-    int pos = 0;
+static void stm32_uart_task(void *pvParameters) {
+    uint8_t data;
+    char buffer[256];
+    uint8_t pos = 0;
     uint8_t binary_state = 0;
-    
-    printf("STM32 UART task started (with stream request support)\n");
-    uart_flush(STM32_UART_PORT);
-    
+    uint8_t cmd = 0;
+    uint16_t len = 0;
+    uint8_t frame_buf[1024];  // Assuming max frame size
+    uint16_t got = 0;
+    uint16_t crc_calc = 0xFFFF;
+    uint16_t crc_recv = 0;
+
+    printf("UART: Entering read loop\n");
+
     while (1) {
-        uint8_t data;
-        int len = uart_read_bytes(STM32_UART_PORT, &data, 1, pdMS_TO_TICKS(10));
-        
-        if (len > 0) {
-            // Check for binary stream request
-            if (data == STREAM_SYNC0 && binary_state == 0) {
-                binary_state = 1;
-                continue;
-            } else if (binary_state == 1) {
-                if (data == STREAM_SYNC1) {
-                    // Read command byte
-                    uint8_t cmd;
-                    uart_read_bytes(STM32_UART_PORT, &cmd, 1, pdMS_TO_TICKS(100));
-                    
-                    if (cmd == STREAM_CMD_REQUEST_MORE) {
-                        // Read payload length (2 bytes)
-                        uint8_t len_bytes[2];
-                        uart_read_bytes(STM32_UART_PORT, len_bytes, 2, pdMS_TO_TICKS(100));
-                        uint16_t payload_len = len_bytes[0] | (len_bytes[1] << 8);
-                        
-                        // Read requested size
-                        if (payload_len == 2) {
-                            uint8_t size_bytes[2];
-                            uart_read_bytes(STM32_UART_PORT, size_bytes, 2, pdMS_TO_TICKS(100));
-                            uint16_t requested = size_bytes[0] | (size_bytes[1] << 8);
-                            
-                            // Skip CRC byte
-                            uint8_t dummy;
-                            uart_read_bytes(STM32_UART_PORT, &dummy, 1, pdMS_TO_TICKS(100));
-                            
-                            // Handle request
-                            handle_stream_request(requested);
+        if (uart_read_bytes(STM32_UART_PORT, &data, 1, pdMS_TO_TICKS(100)) == 1) {
+            //printf("UART: Read byte: 0x%02X (%c)\n", data, (data >= 32 && data < 127 ? data : '.'));
+
+            if (binary_state == 0) {
+                if (data == STREAM_SYNC0) {
+                    binary_state = 1;
+                    continue;
+                }
+            } else {
+                printf("UART: State %d, data 0x%02X\n", binary_state, data);
+                switch (binary_state) {
+                    case 1:  // SYNC1
+                        if (data == STREAM_SYNC1) {
+                            binary_state = 2;
+                        } else {
+                            binary_state = 0;
+                            // Process as text if not sync
+                            if (data >= 32 || data == '\t') {
+                                buffer[pos++] = data;
+                            }
                         }
+                        break;
+                    case 2:  // CMD
+                        cmd = data;
+                        binary_state = 3;
+                        break;
+                    case 3:  // LEN lo
+                        len = data;
+                        binary_state = 4;
+                        break;
+                    case 4:  // LEN hi
+                        len |= (uint16_t)data << 8;
+                        crc_calc = 0xFFFF;
+                        got = 0;
+                        if (len == 0) {
+                            binary_state = 6;  // No payload, go to CRC
+                        } else {
+                            binary_state = 5;
+                        }
+                        break;
+                    case 5:  // Payload bytes
+                        if (got < len) {
+                            frame_buf[got] = data;
+                            crc_calc = crc16_ccitt(crc_calc, data);
+                            got++;
+                            if (got == len) {
+                                binary_state = 6;
+                            }
+                        }
+                        break;
+                    case 6:  // CRC hi
+                        crc_recv = (uint16_t)data << 8;
+                        binary_state = 7;
+                        break;
+                    case 7:  // CRC lo
+                        crc_recv |= data;
+                        binary_state = 8;  // Frame complete
+                        printf("UART: CRC calc=0x%04X, recv=0x%04X\n", crc_calc, crc_recv);
+                        break;
+                }
+
+                if (binary_state == 8) {
+                    if (crc_calc == crc_recv) {
+                        printf("UART: Valid frame, cmd=%d, len=%d\n", cmd, len);
+                        if (cmd == STREAM_CMD_BEGIN) {
+                            if (len == 9 || len == 10) {
+                                uint32_t f_hz = (uint32_t)frame_buf[0] | ((uint32_t)frame_buf[1]<<8) | ((uint32_t)frame_buf[2]<<16) | ((uint32_t)frame_buf[3]<<24);
+                                uint16_t step_us = frame_buf[4] | (frame_buf[5]<<8);
+                                uint16_t guard_us = frame_buf[6] | (frame_buf[7]<<8);
+                                uint8_t inv_mask = frame_buf[8];
+                                bool continuous = (len == 10 && frame_buf[9] == 0xFF);
+
+                                // Apply params
+                                // For example, set TIM4 prescaler/ARR for f_hz
+                                // Here assume we store them
+                                printf("UART: BEGIN f_hz=%lu, step=%u, guard=%u, inv=0x%02X, cont=%d\n", f_hz, step_us, guard_us, inv_mask, continuous);
+
+                                // Reset buffer
+                                cont_stream.read_pos = cont_stream.write_pos = 0;
+                                // etc.
+                            }
+                        } else if (cmd == STREAM_CMD_DATA) {
+                            // Add to buffer
+                            xSemaphoreTake(cont_stream.buffer_mutex, portMAX_DELAY);
+                            for (uint16_t i = 0; i < len; i++) {
+                                cont_stream.buffer[cont_stream.write_pos] = frame_buf[i];
+                                cont_stream.write_pos = (cont_stream.write_pos + 1) % CONTINUOUS_BUFFER_SIZE;
+                            }
+                            xSemaphoreGive(cont_stream.buffer_mutex);
+                            printf("UART: DATA received %u bytes\n", len);
+                        } else if (cmd == STREAM_CMD_START) {
+                            printf("UART: START received\n");
+                            // Start playback
+                        } else if (cmd == STREAM_CMD_ABORT) {
+                            printf("UART: ABORT received\n");
+                            // Abort
+                        } else if (cmd == STREAM_CMD_REQUEST_MORE) {
+                            if (len == 2) {
+                                uint16_t requested = frame_buf[0] | (frame_buf[1] << 8);
+                                printf("UART: Handling REQUEST_MORE for %u bytes\n", requested);
+                                handle_stream_request(requested);
+                            } else {
+                                printf("UART: Invalid len for REQUEST_MORE: %d\n", len);
+                            }
+                        } else if (cmd == STREAM_CMD_END) {
+                            printf("UART: END received\n");
+                            // Handle end
+                        } else if (cmd == STREAM_CMD_ACK) {
+                            printf("UART: ACK received\n");
+                            // Handle ACK
+                        }
+                    } else {
+                        printf("UART: CRC mismatch! calc=0x%04X, recv=0x%04X\n", crc_calc, crc_recv);
                     }
                     binary_state = 0;
+                    printf("UART: Reset to text mode after frame\n");
                     continue;
-                } else {
-                    binary_state = 0;
-                    // Process the SYNC0 and current byte as normal text
                 }
             }
-            
+
             // Normal text processing
             if (data == '\n' || data == '\r') {
                 if (pos > 0) {
                     buffer[pos] = '\0';
+                    printf("UART: Processing text response: '%s'\n", buffer);
                     process_stm32_response(buffer);
                     pos = 0;
                 }
@@ -1193,8 +1426,223 @@ void stm32_uart_task(void *pvParameters) {
     }
 }
 
+// // UART communication task
+// static void stm32_uart_task(void *pvParameters) {
+//     uint8_t data;
+//     char buffer[256];
+//     uint8_t pos = 0;
+//     uint8_t binary_state = 0;
+//     uint8_t sync[2];
+//     uint8_t cmd;
+//     uint16_t len;
+//     uint8_t frame_buf[1024];  // Assuming max frame size
+//     uint16_t crc_calc = 0xFFFF;
+//     uint16_t crc_recv;
+
+//     printf("UART: Entering read loop\n");  // NEW: Log entry
+
+//     while (1) {
+//         if (uart_read_bytes(STM32_UART_PORT, &data, 1, pdMS_TO_TICKS(100)) == 1) {
+//             printf("UART: Read byte: 0x%02X (%c)\n", data, (data >= 32 && data < 127 ? data : '.'));  // NEW: Log every incoming byte
+
+//             if (binary_state == 0) {
+//                 if (data == STREAM_SYNC0) {
+//                     binary_state = 1;
+//                     continue;
+//                 }
+//             } else {
+//                 printf("UART: State %d, data 0x%02X\n", binary_state, data);  // NEW: Log state transitions
+//                 switch (binary_state) {
+//                     case 1:  // SYNC1
+//                         if (data == STREAM_SYNC1) {
+//                             binary_state = 2;
+//                         } else {
+//                             binary_state = 0;
+//                             // Process as text if not sync
+//                             if (data >= 32 || data == '\t') {
+//                                 buffer[pos++] = data;
+//                             }
+//                         }
+//                         break;
+//                     case 2:  // CMD
+//                         cmd = data;
+//                         binary_state = 3;
+//                         break;
+//                     case 3:  // LEN lo
+//                         len = data;
+//                         binary_state = 4;
+//                         break;
+//                     case 4:  // LEN hi
+//                         len |= (uint16_t)data << 8;
+//                         crc_calc = 0xFFFF;
+//                         if (len == 0) {
+//                             binary_state = 6;  // No payload, go to CRC
+//                         } else {
+//                             binary_state = 5;
+//                         }
+//                         break;
+//                     case 5:  // Payload bytes
+//                         if (got < len) {
+//                             frame_buf[got] = data;
+//                             crc_calc = crc16_ccitt(crc_calc, data);
+//                             got++;
+//                             if (got == len) {
+//                                 binary_state = 6;
+//                             }
+//                         }
+//                         break;
+//                     case 6:  // CRC hi
+//                         crc_recv = (uint16_t)data << 8;
+//                         binary_state = 7;
+//                         break;
+//                     case 7:  // CRC lo
+//                         crc_recv |= data;
+//                         binary_state = 8;  // Frame complete
+//                         printf("UART: CRC calc=0x%04X, recv=0x%04X\n", crc_calc, crc_recv);  // NEW: Log CRC check
+//                         break;
+//                 }
+
+//                 if (binary_state == 8) {
+//                     if (crc_calc == crc_recv) {
+//                         printf("UART: Valid frame, cmd=%d, len=%d\n", cmd, len);  // NEW: Log successful frame
+//                         if (cmd == STREAM_CMD_BEGIN) {
+//                             // (code elided)
+//                         } else if (cmd == STREAM_CMD_DATA) {
+//                             // (code elided)
+//                         } else if (cmd == STREAM_CMD_START) {
+//                             // (code elided)
+//                         } else if (cmd == STREAM_CMD_ABORT) {
+//                             // (code elided)
+//                         } else if (cmd == STREAM_CMD_REQUEST_MORE) {
+//                             if (len == 2) {
+//                                 uint16_t requested = frame_buf[0] | (frame_buf[1] << 8);
+//                                 printf("UART: Handling REQUEST_MORE for %u bytes\n", requested);  // NEW: Log request handling
+//                                 handle_stream_request(requested);
+//                             } else {
+//                                 printf("UART: Invalid len for REQUEST_MORE: %d\n", len);  // NEW: Error log
+//                             }
+//                         } else if (cmd == STREAM_CMD_END) {
+//                             // ... (existing code if any)
+//                         } else if (cmd == STREAM_CMD_ACK) {
+//                             // ... (existing code if any)
+//                         }
+//                     } else {
+//                         printf("UART: CRC mismatch! calc=0x%04X, recv=0x%04X\n", crc_calc, crc_recv);  // NEW: Log CRC error
+//                     }
+//                     binary_state = 0;
+//                     printf("UART: Reset to text mode after frame\n");  // NEW: Log reset
+//                     continue;
+//                 }
+//             }
+
+//             // Normal text processing
+//             if (data == '\n' || data == '\r') {
+//                 if (pos > 0) {
+//                     buffer[pos] = '\0';
+//                     process_stm32_response(buffer);
+//                     pos = 0;
+//                 }
+//             } else if (pos < sizeof(buffer) - 1) {
+//                 if (data >= 32 || data == '\t') {
+//                     buffer[pos++] = data;
+//                 }
+//             } else {
+//                 pos = 0;
+//             }
+//         }
+        
+//         taskYIELD();
+//     }
+// }
+
+// void stm32_uart_task(void *pvParameters) {
+//     char buffer[512];
+//     int pos = 0;
+//     uint8_t binary_state = 0;
+    
+//     printf("STM32 UART task started (with stream request support)\n");
+//     uart_flush(STM32_UART_PORT);
+    
+//     while (1) {
+//         uint8_t data;
+//         int len = uart_read_bytes(STM32_UART_PORT, &data, 1, pdMS_TO_TICKS(10));
+        
+//         if (len > 0) {
+//             // Check for binary stream request
+//             if (data == STREAM_SYNC0 && binary_state == 0) {
+//                 binary_state = 1;
+//                 continue;
+//             } else if (binary_state == 1) {
+//                 if (data == STREAM_SYNC1) {
+//                     // Read command byte
+//                     uint8_t cmd;
+//                     uart_read_bytes(STM32_UART_PORT, &cmd, 1, pdMS_TO_TICKS(100));
+                    
+//                     if (cmd == STREAM_CMD_REQUEST_MORE) {
+//                         // Read payload length (2 bytes)
+//                         uint8_t len_bytes[2];
+//                         uart_read_bytes(STM32_UART_PORT, len_bytes, 2, pdMS_TO_TICKS(100));
+//                         uint16_t payload_len = len_bytes[0] | (len_bytes[1] << 8);
+                        
+//                         // Read requested size
+//                         if (payload_len == 2) {
+//                             uint8_t size_bytes[2];
+//                             uart_read_bytes(STM32_UART_PORT, size_bytes, 2, pdMS_TO_TICKS(100));
+//                             uint16_t requested = size_bytes[0] | (size_bytes[1] << 8);
+                            
+//                             // Handle request
+//                             handle_stream_request(requested);
+//                         }
+//                     }
+//                     binary_state = 0;
+//                     continue;
+//                 } else {
+//                     binary_state = 0;
+//                     // Process the SYNC0 and current byte as normal text
+//                 }
+//             }
+            
+//             // Normal text processing
+//             if (data == '\n' || data == '\r') {
+//                 if (pos > 0) {
+//                     buffer[pos] = '\0';
+//                     process_stm32_response(buffer);
+//                     pos = 0;
+//                 }
+//             } else if (pos < sizeof(buffer) - 1) {
+//                 if (data >= 32 || data == '\t') {
+//                     buffer[pos++] = data;
+//                 }
+//             } else {
+//                 pos = 0;
+//             }
+//         }
+        
+//         taskYIELD();
+//     }
+// }
+
 void start_continuous_spiral(void) {
     printf("Starting continuous spiral streaming\n");
+    
+    // Ensure we're homed first
+    if (!plotter.is_homed) {
+        printf("ERROR: Not homed, please home first\n");
+        return;  // NEW: Abort early
+    }
+    
+    // Get limits if needed
+    if (plotter.x_max == 0.0f || plotter.y_max == 0.0f) {
+        send_to_stm32_cmd(CMD_GET_LIMITS, NULL);
+        vTaskDelay(pdMS_TO_TICKS(2000));  // Increased from 1000ms for response time
+    }
+    
+    // NEW: Check if limits were successfully obtained
+    if (plotter.x_max <= 0.0f || plotter.y_max <= 0.0f) {
+        printf("ERROR: Invalid limits (X=%.2f, Y=%.2f) - cannot start spiral\n",
+               plotter.x_max, plotter.y_max);
+        return;  // Abort to prevent zero-byte generation and crash
+    }
     
     // Initialize
     continuous_stream_init();
@@ -1226,6 +1674,12 @@ void start_continuous_spiral(void) {
     
     // Send START command
     stream_send_frame(STREAM_CMD_START, NULL, 0);
+    
+    // Важно: даем время на обработку бинарного кадра
+    vTaskDelay(pdMS_TO_TICKS(50));
+    
+    // Очищаем UART буфер от возможного мусора
+    uart_flush(STM32_UART_PORT);
     
     printf("Continuous streaming started\n");
 }
@@ -1662,17 +2116,21 @@ void process_keypad_command(char key) {
                 break;
             }
             
-            // Get limits if needed
+            // NEW: Fetch and validate limits here too (redundant with start_continuous_spiral, but ensures safety)
             if (plotter.x_max == 0.0f || plotter.y_max == 0.0f) {
                 send_to_stm32_cmd(CMD_GET_LIMITS, NULL);
-                vTaskDelay(pdMS_TO_TICKS(1000));
+                vTaskDelay(pdMS_TO_TICKS(2000));
+            }
+            if (plotter.x_max <= 0.0f || plotter.y_max <= 0.0f) {
+                printf("ERROR: Invalid limits - cannot start spiral\n");
+                break;
             }
             
             // Start continuous streaming
             start_continuous_spiral();
             break;
-        }
-        
+        }        
+
         case 'B':  // Stop continuous streaming
         {
             printf("KEYPAD: Stopping continuous stream\n");
@@ -1774,18 +2232,8 @@ void app_main() {
     // Start tasks with proper priorities
     xTaskCreate(stm32_uart_task, "stm32_uart", 4096, NULL, 5, NULL);
     xTaskCreate(plotter_control_task, "plotter_control", 4096, NULL, 4, NULL);
-    xTaskCreate(keypad_task, "keypad", 2048, NULL, 3, NULL);
-        // xTaskCreate(
-    //     draw_concentric_circles_task,   // task function
-    //     "draw_circles",                 // task name
-    //     8192,                           // stack size
-    //     NULL,                           // params
-    //     3,                              // priority
-    //     NULL                            // task handle
-    // );
-    
+    xTaskCreate(keypad_task, "keypad", 4096, NULL, 3, NULL);
     // Optional: enable test movement task
-    // xTaskCreate(test_movement_task, "test_movement", 2048, NULL, 2, NULL);
     
     // Main display loop - reduced delay for more responsive display
     while (1) {
@@ -1795,3 +2243,4 @@ void app_main() {
 }
 
 // idf.py -p /dev/ttyUSB0 -b 115200 flash monitor
+//. ~/esp-idf/export.sh
