@@ -1090,7 +1090,7 @@ void process_stm32_response(const char* response) {
 
 // UART communication task
 void stm32_uart_task(void *pvParameters) {
-    char buffer[512];  // Increased from 256
+    char buffer[512];
     int pos = 0;
     
     printf("STM32 UART task started\n");
@@ -1103,14 +1103,37 @@ void stm32_uart_task(void *pvParameters) {
         int len = uart_read_bytes(STM32_UART_PORT, &data, 1, pdMS_TO_TICKS(10));
         
         if (len > 0) {
+            // Проверяем на бинарные данные от STM32 (например, ответы на STREAM команды)
+            // STM32 может отправлять "STREAM: ..." сообщения
+            
             if (data == '\n' || data == '\r') {
                 if (pos > 0) {
                     buffer[pos] = '\0';
-                    process_stm32_response(buffer);
+                    
+                    // Проверяем, не является ли это отладочным сообщением о STREAM
+                    if (strstr(buffer, "STREAM:") || 
+                        strstr(buffer, "SELFTEST:") ||
+                        strstr(buffer, "DEBUG:")) {
+                        // Это отладочное сообщение, просто выводим
+                        printf("STM32: %s\n", buffer);
+                    } else if (strstr(buffer, "Invalid format") || 
+                               strstr(buffer, "Invalid response format")) {
+                        // Игнорируем ошибки парсинга от предыдущих попыток
+                        // Не выводим, чтобы не засорять лог
+                    } else {
+                        // Обычное сообщение-ответ
+                        process_stm32_response(buffer);
+                    }
                     pos = 0;
                 }
             } else if (pos < sizeof(buffer) - 1) {
-                buffer[pos++] = data;
+                // Фильтруем непечатаемые символы кроме специальных
+                if (data >= 32 || data == '\t') {
+                    buffer[pos++] = data;
+                }
+            } else {
+                // Буфер переполнен, сбрасываем
+                pos = 0;
             }
         }
         
@@ -1500,6 +1523,26 @@ void draw_concentric_circles_task(void *pvParameters) {
     
     printf("CIRCLES: Task completed, deleting task\n");
     vTaskDelete(NULL);
+}
+
+void test_simple_move(void) {
+    printf("\n=== TEST: Simple manual movement ===\n");
+    
+    // Отправляем простые текстовые команды для проверки
+    send_to_stm32_cmd(CMD_HOME, NULL);
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    
+    send_to_stm32_cmd(CMD_PEN_UP, NULL);
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    
+    // Простое движение
+    send_to_stm32_cmd(CMD_G0_RAPID, "X10.0,Y10.0");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    
+    send_to_stm32_cmd(CMD_G0_RAPID, "X20.0,Y20.0");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    
+    printf("TEST: Complete\n");
 }
 
 void app_main() {
