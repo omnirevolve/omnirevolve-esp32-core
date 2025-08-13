@@ -11,16 +11,6 @@
 
 #include "driver/spi_master.h"
 
-// SPI Stream state
-typedef struct {
-    uint8_t active;
-    uint8_t *tx_buffer;
-    size_t tx_size;
-    TaskHandle_t sender_task;
-} spi_stream_t;
-
-static spi_stream_t spi_stream = {0};
-
 // SPI Configuration for STM32 communication
 #define STM32_SPI_HOST    HSPI_HOST
 #define STM32_SPI_MOSI    13   // GPIO13
@@ -61,6 +51,7 @@ static spi_stream_t spi_stream = {0};
 #define HEARTBEAT_PERIOD_MS    1000
 #define CONNECT_TIMEOUT_MS     3000
 
+#define UART_BUFFER_SIZE 256
 
 static spi_device_handle_t stm32_spi = NULL;
 
@@ -132,8 +123,7 @@ const char* command_names[CMD_COUNT] = {
 #define STEPS_PER_MM  40.0f
 #define MM_PER_STEP   (1.0f / STEPS_PER_MM)
 
-#define STREAM_PKT_BYTES 1024
-static uint8_t stream_pkt[STREAM_PKT_BYTES];
+static uint8_t line_nibbles_buffer[2048];  // Буфер для nibbles одной линии
 
 // GPIO пины для клавиатуры (можно изменить под вашу схему)
 static const int row_pins[KEYPAD_ROWS] = {32, 33, 27}; // Выходы (строки)
@@ -232,83 +222,161 @@ static bool wait_command_completion(uint32_t request_id, const char* step_name, 
 // =============================== TEST STREAMING END 2 ===================================
 
 // =============================== TEST STREAMING BEGIN 2 ===================================
-void draw_circle_spi(float cx_mm, float cy_mm, float radius_mm, float speed_mm_s) {
-    const int segments = 72;
-    const float angle_step = 2.0f * M_PI / segments;
+// size_t generate_line_nibbles(float x0_mm, float y0_mm, float x1_mm, float y1_mm, float speed_mm_s);
+
+size_t generate_line_nibbles(float x0_mm, float y0_mm, float x1_mm, float y1_mm, float speed_mm_s);
+static inline bool is_stm32_ready(void) {
+    return gpio_get_level(STM32_READY_PIN) == 1;
+}
+
+void send_line(float x0_mm, float y0_mm, float x1_mm, float y1_mm, float speed_mm_s)
+{
+    uint32_t req_id = send_to_stm32_cmd(CMD_DRAW_BEGIN, NULL);
+    vTaskDelay(pdMS_TO_TICKS(500));
     
-    // Prepare nibbles buffer
-    size_t buffer_size = segments * 100;  // Rough estimate
-    uint8_t *nibbles = malloc(buffer_size);
-    if (!nibbles) return;
-    
-    size_t nibble_count = 0;
-    float acc_x = 0, acc_y = 0;
-    float prev_x = cx_mm + radius_mm;
-    float prev_y = cy_mm;
-    
-    // Generate nibbles for circle
-    for (int i = 1; i <= segments; i++) {
-        float angle = angle_step * i;
-        float x = cx_mm + radius_mm * cosf(angle);
-        float y = cy_mm + radius_mm * sinf(angle);
-        
-        float dx_mm = x - prev_x;
-        float dy_mm = y - prev_y;
-        
-        acc_x += dx_mm * STEPS_PER_MM;
-        acc_y += dy_mm * STEPS_PER_MM;
-        
-        // Generate steps
-        while (fabsf(acc_x) >= 1.0f || fabsf(acc_y) >= 1.0f) {
-            uint8_t nib = 0;
-            
-            if (acc_x >= 1.0f) {
-                nib |= NIBBLE_X_STEP | NIBBLE_X_DIR;
-                acc_x -= 1.0f;
-            } else if (acc_x <= -1.0f) {
-                nib |= NIBBLE_X_STEP;
-                acc_x += 1.0f;
-            }
-            
-            if (acc_y >= 1.0f) {
-                nib |= NIBBLE_Y_STEP | NIBBLE_Y_DIR;
-                acc_y -= 1.0f;
-            } else if (acc_y <= -1.0f) {
-                nib |= NIBBLE_Y_STEP;
-                acc_y += 1.0f;
-            }
-            
-            // Pack two nibbles per byte
-            if (nibble_count % 2 == 0) {
-                nibbles[nibble_count/2] = nib;
-            } else {
-                nibbles[nibble_count/2] |= (nib << 4);
-            }
-            nibble_count++;
-            
-            if (nibble_count >= buffer_size * 2) break;
-        }
-        
-        prev_x = x;
-        prev_y = y;
+    int wait_count = 0;
+    while (!is_stm32_ready() && wait_count < 50) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        wait_count++;
     }
     
-    // Start SPI stream
-    send_to_stm32_cmd(CMD_DRAW_BEGIN, NULL);
-    vTaskDelay(pdMS_TO_TICKS(100));
-    
-    // Send nibbles via SPI
-    size_t bytes_to_send = (nibble_count + 1) / 2;
-    spi_send_nibbles(nibbles, bytes_to_send);
-    
-    // Wait for movement to complete
-    vTaskDelay(pdMS_TO_TICKS(5000));  // Adjust based on circle size
-    
-    // Finish stream
-    send_to_stm32_cmd(CMD_DRAW_FINISH_WHEN_EMPTY, NULL);
-    
-    free(nibbles);
+    if (!is_stm32_ready()) {
+        printf("ERROR: STM32 not ready for streaming\n");
+        return;
+    }
+
+    size_t nibbles_count = generate_line_nibbles(
+        x0_mm, y0_mm, x1_mm, y1_mm, speed_mm_s);
+
+    if (nibbles_count > 0)
+    {
+        size_t bytes_to_send = SPI_CHUNK_SIZE; // Всегда 2048
+        memset(&line_nibbles_buffer[nibbles_count/2], 0, bytes_to_send - nibbles_count/2);
+        spi_send_nibbles(line_nibbles_buffer, bytes_to_send);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        send_to_stm32_cmd(CMD_DRAW_FINISH_WHEN_EMPTY, NULL);        
+    }
+    else
+    {
+        printf("WARNING: No nibbles generated for test line\n");
+    }
 }
+
+void debug_print_nibbles(const uint8_t *data, size_t byte_count, const char *label)
+{
+    printf("DEBUG %s: %zu bytes = %zu nibbles\n", label, byte_count, byte_count * 2);
+    // Печатаем первые несколько байт для анализа
+    size_t print_count = (byte_count > 10) ? 10 : byte_count;
+    printf("  First bytes (hex): ");
+    for (size_t i = 0; i < print_count; i++)
+    {
+        printf("%02X ", data[i]);
+    }
+    printf("\n");
+
+    // Декодируем первые nibbles
+    printf("  First nibbles decoded:\n");
+    for (size_t i = 0; i < print_count && i < 5; i++)
+    {
+        uint8_t low_nib = data[i] & 0x0F;
+        uint8_t high_nib = (data[i] >> 4) & 0x0F;
+
+        printf("    [%zu] Low: X%s%s Y%s%s | High: X%s%s Y%s%s\n", i,
+               (low_nib & NIBBLE_X_DIR) ? "+" : "-",
+               (low_nib & NIBBLE_X_STEP) ? "STEP" : "----",
+               (low_nib & NIBBLE_Y_DIR) ? "+" : "-",
+               (low_nib & NIBBLE_Y_STEP) ? "STEP" : "----",
+               (high_nib & NIBBLE_X_DIR) ? "+" : "-",
+               (high_nib & NIBBLE_X_STEP) ? "STEP" : "----",
+               (high_nib & NIBBLE_Y_DIR) ? "+" : "-",
+               (high_nib & NIBBLE_Y_STEP) ? "STEP" : "----");
+    }
+}
+
+size_t generate_line_nibbles(float x0_mm, float y0_mm, float x1_mm, float y1_mm, float speed_mm_s)
+{
+    // Конвертируем в шаги
+    int32_t x0_steps = (int32_t)(x0_mm * STEPS_PER_MM);
+    int32_t y0_steps = (int32_t)(y0_mm * STEPS_PER_MM);
+    int32_t x1_steps = (int32_t)(x1_mm * STEPS_PER_MM);
+    int32_t y1_steps = (int32_t)(y1_mm * STEPS_PER_MM);
+    
+    int32_t dx = x1_steps - x0_steps;
+    int32_t dy = y1_steps - y0_steps;
+    
+    // Направления
+    uint8_t x_dir = (dx >= 0) ? 1 : 0;
+    uint8_t y_dir = (dy >= 0) ? 1 : 0;
+    
+    uint32_t ax = abs(dx);
+    uint32_t ay = abs(dy);
+    
+    // Расчет времени и тиков
+    float distance_mm = sqrtf((float)(dx * dx + dy * dy)) / STEPS_PER_MM;
+    float time_s = distance_mm / speed_mm_s;
+    uint32_t ticks_total = (uint32_t)(time_s * STREAM_F_HZ);
+    
+    // Минимум один тик на шаг
+    uint32_t max_steps = (ax > ay) ? ax : ay;
+    if (ticks_total < max_steps) {
+        ticks_total = max_steps;
+    }
+    
+    printf("Generating line: %lu x-steps, %lu y-steps in %lu ticks\n", 
+           ax, ay, ticks_total);
+    
+    // Классический Bresenham с временной интерполяцией
+    memset(line_nibbles_buffer, 0, sizeof(line_nibbles_buffer));
+    size_t nibble_count = 0;
+    
+    // Счетчики прогресса
+    float x_progress = 0;
+    float y_progress = 0;
+    float x_increment = (float)ax / ticks_total;
+    float y_increment = (float)ay / ticks_total;
+    uint32_t x_steps_done = 0;
+    uint32_t y_steps_done = 0;
+    
+    for (uint32_t tick = 0; tick < ticks_total && nibble_count < sizeof(line_nibbles_buffer) * 2; tick++) {
+        uint8_t nib = 0;
+        
+        // Направления всегда устанавливаем
+        if (x_dir) nib |= NIBBLE_X_DIR;
+        if (y_dir) nib |= NIBBLE_Y_DIR;
+        
+        // Накапливаем прогресс
+        x_progress += x_increment;
+        y_progress += y_increment;
+        
+        // Генерируем шаг X если накопилось
+        if (x_progress >= 1.0f && x_steps_done < ax) {
+            nib |= NIBBLE_X_STEP;
+            x_progress -= 1.0f;
+            x_steps_done++;
+        }
+        
+        // Генерируем шаг Y если накопилось
+        if (y_progress >= 1.0f && y_steps_done < ay) {
+            nib |= NIBBLE_Y_STEP;
+            y_progress -= 1.0f;
+            y_steps_done++;
+        }
+        
+        // Сохраняем nibble
+        if (nibble_count % 2 == 0) {
+            line_nibbles_buffer[nibble_count / 2] = nib;
+        } else {
+            line_nibbles_buffer[nibble_count / 2] |= (nib << 4);
+        }
+        nibble_count++;
+    }
+    
+    printf("Generated %zu nibbles: X_steps=%lu/%lu, Y_steps=%lu/%lu\n",
+           nibble_count, x_steps_done, ax, y_steps_done, ay);
+    
+    return nibble_count;
+}
+
 
 void keypad_init(void) {
     // Настройка пинов строк как выходы
@@ -379,80 +447,6 @@ void keypad_task(void *pvParameters) {
 }
 
 uint32_t send_to_stm32_cmd(command_id_t cmd_id, const char* params);
-
-void draw_concentric_circles_task(void *pvParameters);
-
-// Build ticks for a single line segment at fixed sample rate.
-// Each tick = 4 bits: [Y_DIR][Y_STEP][X_DIR][X_STEP]
-static size_t build_ticks_line(float x0_mm, float y0_mm,
-                               float x1_mm, float y1_mm,
-                               float v_mm_s,   // requested linear speed
-                               uint32_t f_hz,  // sample rate
-                               uint8_t *out, size_t out_cap_bytes)
-{
-    // Convert to steps
-    float dx_mm = x1_mm - x0_mm;
-    float dy_mm = y1_mm - y0_mm;
-    float dist_mm = sqrtf(dx_mm*dx_mm + dy_mm*dy_mm);
-    if (dist_mm <= 1e-6f) return 0;
-
-    float dirx = (dx_mm >= 0) ? 1.f : -1.f;
-    float diry = (dy_mm >= 0) ? 1.f : -1.f;
-
-    float dx_steps_abs = fabsf(dx_mm) * STEPS_PER_MM;
-    float dy_steps_abs = fabsf(dy_mm) * STEPS_PER_MM;
-
-    // time needed with requested speed
-    float t_sec = dist_mm / fmaxf(v_mm_s, 1e-3f);
-    // number of ticks for this segment
-    uint32_t ticks = (uint32_t)lroundf(t_sec * (float)f_hz);
-    if (ticks == 0) ticks = 1;
-
-    // per-tick fractional step rates
-    float sx = dx_steps_abs / (float)ticks;
-    float sy = dy_steps_abs / (float)ticks;
-
-    float ax = 0.f, ay = 0.f;
-    size_t produced_ticks = 0;
-
-    // Pack two nibbles per byte
-    uint8_t cur_byte = 0;
-    int nib_idx = 0;
-
-    for (uint32_t i=0; i<ticks; ++i) {
-        uint8_t t = 0;
-        // set DIR bits
-        if (dirx > 0) t |= (1u<<1); // X_DIR=1 => +X
-        if (diry > 0) t |= (1u<<3); // Y_DIR=1 => +Y
-
-        ax += sx;
-        ay += sy;
-
-        if (ax >= 1.0f) { t |= (1u<<0); ax -= 1.0f; }
-        if (ay >= 1.0f) { t |= (1u<<2); ay -= 1.0f; }
-
-        // pack nibble
-        if (nib_idx == 0) {
-            cur_byte = (t & 0x0F);
-            nib_idx = 1;
-        } else {
-            cur_byte |= (uint8_t)((t & 0x0F) << 4);
-            if (produced_ticks/2 < out_cap_bytes) {
-                out[produced_ticks/2] = cur_byte;
-            }
-            nib_idx = 0;
-        }
-        produced_ticks++;
-        if ((produced_ticks+1)/2 >= out_cap_bytes) break; // avoid overflow
-    }
-
-    // flush last half-filled byte
-    if (nib_idx == 1 && (produced_ticks+1)/2 <= out_cap_bytes) {
-        out[produced_ticks/2] = cur_byte;
-    }
-
-    return produced_ticks; // number of ticks (nibbles), not bytes
-}
 
 // Display management
 void update_display() {
@@ -545,7 +539,6 @@ uint32_t send_to_stm32_cmd(command_id_t cmd_id, const char* params) {
 }
 
 void process_stm32_response(const char* response) {
-    // Сначала пытаемся распарсить как команду
     uint32_t received_id;
     uint32_t cmd_id;
     char data[256] = {0};
@@ -686,15 +679,13 @@ void process_stm32_response(const char* response) {
         }
     }
     else {
-        // Это отладочное сообщение
-        printf("------- %s\n", response);
     }
     plotter.is_connected = true;
 }
 
 static void stm32_uart_task(void *pvParameters) {
     uint8_t data;
-    char buffer[256];
+    char buffer[UART_BUFFER_SIZE];
     uint8_t pos = 0;
 
     printf("UART: Entering read loop\n");
@@ -705,13 +696,18 @@ static void stm32_uart_task(void *pvParameters) {
             if (data == '\n' || data == '\r') {
                 if (pos > 0) {
                     buffer[pos] = '\0';
-                    printf("UART: Processing text response: '%s'\n", buffer);
+                    printf("STM32 says:  '%s'\n", buffer);
                     process_stm32_response(buffer);
                     pos = 0;
                 }
             } else if (pos < sizeof(buffer) - 1) {
                 if (data >= 32 || data == '\t') {
                     buffer[pos++] = data;
+                    if (pos >= UART_BUFFER_SIZE)
+                    {
+                        printf("ATTENTION: Overflow attempt in UART");
+                        pos = 0;
+                    }
                 }
             } else {
                 pos = 0;
@@ -870,131 +866,161 @@ static bool wait_command_completion(uint32_t request_id, const char* step_name, 
     return false;
 }
 
-static inline bool is_stm32_ready(void) {
-    return gpio_get_level(STM32_READY_PIN) == 1;
-}
-
 // ============ Send nibbles via SPI ============
 
-static void spi_send_nibbles(const uint8_t *data, size_t len) {
-    if (!stm32_spi || !data || len == 0) return;
-    
-    // Wait for READY signal
-    int wait_count = 0;
-    while (!is_stm32_ready() && wait_count < 100) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-        wait_count++;
-    }
-    
-    if (!is_stm32_ready()) {
-        printf("SPI: STM32 not ready, skipping transfer\n");
+static void spi_send_nibbles(const uint8_t *data, size_t len)
+{
+    printf("\n=== SPI SEND NIBBLES ===\n");
+    printf("Sending %zu bytes via SPI\n", len);
+
+    if (!stm32_spi || !data || len == 0)
+    {
+        printf("ERROR: Invalid parameters for SPI send\n");
         return;
     }
-    
-    // Send data in chunks
+
+    // Проверка READY сигнала
+    int ready_wait = 0;
+    while (!is_stm32_ready() && ready_wait < 50)
+    {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        ready_wait++;
+    }
+
+    if (!is_stm32_ready())
+    {
+        printf("ERROR: STM32 not ready after %dms wait\n", ready_wait * 10);
+        printf("READY pin state: %d\n", gpio_get_level(STM32_READY_PIN));
+        return;
+    }
+
+    printf("STM32 is ready, starting transfer\n");
+
+    // Отправляем данные кусками
     size_t sent = 0;
-    while (sent < len) {
+    int chunk_num = 0;
+
+    while (sent < len)
+    {
         size_t chunk_size = (len - sent > SPI_CHUNK_SIZE) ? SPI_CHUNK_SIZE : (len - sent);
-        
+
+        printf("  Chunk %d: sending %zu bytes (offset %zu)\n", chunk_num++, chunk_size, sent);
+
+        // Отладка: печать первых байт чанка
+        if (chunk_size > 0)
+        {
+            printf("    First bytes: ");
+            for (size_t i = 0; i < 4 && i < chunk_size; i++)
+            {
+                printf("%02X ", data[sent + i]);
+            }
+            printf("\n");
+        }
+
         spi_transaction_t trans = {
-            .length = chunk_size * 8,  // In bits
+            .length = chunk_size * 8, // В битах
             .tx_buffer = &data[sent],
-            .rx_buffer = NULL
-        };
-        
+            .rx_buffer = NULL,
+            .flags = 0};
+
         esp_err_t ret = spi_device_transmit(stm32_spi, &trans);
-        if (ret != ESP_OK) {
-            printf("SPI transmit failed: %s\n", esp_err_to_name(ret));
+        if (ret != ESP_OK)
+        {
+            printf("ERROR: SPI transmit failed: %s\n", esp_err_to_name(ret));
             break;
         }
-        
+
         sent += chunk_size;
-        
-        // Small delay between chunks
-        if (sent < len) {
+
+        // Проверяем READY после каждого чанка
+        if (sent < len)
+        {
             vTaskDelay(pdMS_TO_TICKS(5));
+            if (!is_stm32_ready())
+            {
+                printf("WARNING: STM32 became not ready after %zu bytes\n", sent);
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
         }
     }
+
+    printf("SPI transfer complete: sent %zu/%zu bytes\n", sent, len);
 }
 
-// ============ Continuous SPI sender task ============
+// ============ NIBBLES GEN FOR LINE ============
 
-static void spi_continuous_sender_task(void *pvParams) {
-    printf("SPI sender task started\n");
+// size_t generate_line_nibbles(float x0_mm, float y0_mm, float x1_mm, float y1_mm, float speed_mm_s) {
+//     // Конвертировать в шаги
+//     int32_t x0_steps = (int32_t)(x0_mm * STEPS_PER_MM);
+//     int32_t y0_steps = (int32_t)(y0_mm * STEPS_PER_MM);
+//     int32_t x1_steps = (int32_t)(x1_mm * STEPS_PER_MM);
+//     int32_t y1_steps = (int32_t)(y1_mm * STEPS_PER_MM);
     
-    while (spi_stream.active) {
-        // Check if STM32 wants data
-        if (is_stm32_ready()) {
-            // Get data from generator buffer (similar to cont_stream logic)
-            uint8_t chunk[SPI_CHUNK_SIZE];
-            size_t available = 0;
-            
-            // TODO: Get data from your generator buffer
-            // For now, just send test pattern
-            for (int i = 0; i < SPI_CHUNK_SIZE/2; i++) {
-                // Simple test: alternating X and Y steps
-                chunk[i*2] = 0x05;     // X step + dir
-                chunk[i*2+1] = 0x0A;   // Y step + dir
-            }
-            available = SPI_CHUNK_SIZE;
-            
-            if (available > 0) {
-                spi_send_nibbles(chunk, available);
-            }
-        }
+//     int32_t dx = x1_steps - x0_steps;
+//     int32_t dy = y1_steps - y0_steps;
+    
+//     if (dx == 0 && dy == 0) return 0;
+    
+//     // Определить направления
+//     uint8_t x_dir = (dx >= 0) ? 1 : 0;
+//     uint8_t y_dir = (dy >= 0) ? 1 : 0;
+    
+//     uint32_t ax = abs(dx);
+//     uint32_t ay = abs(dy);
+//     uint32_t steps_total = (ax > ay) ? ax : ay;
+    
+//     // Рассчитать timing
+//     float distance_mm = sqrtf(dx*dx + dy*dy) / STEPS_PER_MM;
+//     float time_s = distance_mm / speed_mm_s;
+//     uint32_t ticks_total = (uint32_t)(time_s * STREAM_F_HZ);
+//     if (ticks_total < steps_total) ticks_total = steps_total;
+    
+//     // Bresenham с timing
+//     int32_t err_x = 0, err_y = 0;
+//     uint32_t steps_done = 0;
+//     size_t nibble_count = 0;
+//     uint32_t tick_interval = ticks_total / steps_total;
+//     if (tick_interval < 1) tick_interval = 1;
+    
+//     for (uint32_t tick = 0; tick < ticks_total && nibble_count < sizeof(line_nibbles_buffer)*2; tick++) {
+//         uint8_t nib = 0;
         
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
+//         // Установить биты направления
+//         if (x_dir) nib |= (1<<1);  // X_DIR
+//         if (y_dir) nib |= (1<<3);  // Y_DIR
+        
+//         // Проверить нужность шагов (только каждый tick_interval тиков)
+//         if ((tick % tick_interval == 0) && steps_done < steps_total) {
+//             err_x += ax;
+//             if (err_x >= steps_total) {
+//                 err_x -= steps_total;
+//                 nib |= (1<<0);  // X_STEP
+//             }
+            
+//             err_y += ay;
+//             if (err_y >= steps_total) {
+//                 err_y -= steps_total;
+//                 nib |= (1<<2);  // Y_STEP
+//             }
+            
+//             if (nib & ((1<<0) | (1<<2))) {  // Если есть хотя бы один шаг
+//                 steps_done++;
+//             }
+//         }
+        
+//         // Упаковать nibble
+//         if (nibble_count % 2 == 0) {
+//             line_nibbles_buffer[nibble_count/2] = nib;
+//         } else {
+//             line_nibbles_buffer[nibble_count/2] |= (nib << 4);
+//         }
+//         nibble_count++;
+//     }
     
-    printf("SPI sender task ended\n");
-    vTaskDelete(NULL);
-}
-
-// ============ Start SPI streaming ============
-
-static void start_spi_stream(void) {
-    if (spi_stream.active) {
-        printf("SPI stream already active\n");
-        return;
-    }
-    
-    // Send CMD_DRAW_BEGIN to STM32
-    uint32_t req_id = send_to_stm32_cmd(CMD_DRAW_BEGIN, NULL);
-    
-    // Wait for acknowledgment
-    vTaskDelay(pdMS_TO_TICKS(100));
-    
-    // Start streaming
-    spi_stream.active = 1;
-    
-    // Create sender task
-    xTaskCreate(spi_continuous_sender_task, "spi_sender", 4096, NULL, 5, &spi_stream.sender_task);
-    
-    printf("SPI streaming started\n");
-}
-
-// ============ Stop SPI streaming ============
-
-static void stop_spi_stream(void) {
-    if (!spi_stream.active) {
-        printf("SPI stream not active\n");
-        return;
-    }
-    
-    // Send CMD_DRAW_FINISH_WHEN_EMPTY to STM32
-    send_to_stm32_cmd(CMD_DRAW_FINISH_WHEN_EMPTY, NULL);
-    
-    // Stop streaming
-    spi_stream.active = 0;
-    
-    // Wait for task to finish
-    if (spi_stream.sender_task) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        spi_stream.sender_task = NULL;
-    }
-    
-    printf("SPI streaming stopped\n");
-}
+//     printf("LINE: Generated %zu nibbles for %lu steps\n", nibble_count, steps_done);
+//     return nibble_count;
+// }
+// ============ KEYPAD HANDLING ============
 
 void process_keypad_command(char key) {
     printf("\n=== KEYPAD: Key '%c' pressed ===\n", key);
@@ -1012,23 +1038,35 @@ void process_keypad_command(char key) {
             send_to_stm32_cmd(CMD_HOME, NULL);
             break;
             
-        case '3':  // Start SPI streaming test
-            printf("KEYPAD: Starting SPI stream test\n");
-            start_spi_stream();
+        case '3':  // УПРОЩЕННЫЙ тест SPI без пера
+            plotter.x_max = 15;
+            plotter.y_max = 15;
+            printf("KEYPAD: Testing SPI circle draw (no pen)\n");
+            if (plotter.is_calibrated && plotter.is_homed) {
+                // Сразу рисовать круг БЕЗ команд пера
+                if (plotter.x_max > 0 && plotter.y_max > 0) {
+                    float cx = plotter.x_max / 2.0f;
+                    float cy = plotter.y_max / 2.0f;
+                    float radius = fminf(plotter.x_max, 
+                                       plotter.y_max) / 6.0f;
+                    
+                    printf("KEYPAD: Drawing circle at (%.1f,%.1f) r=%.1f\n", cx, cy, radius);
+                    send_line(0, 0, 5, 5, 30);
+                    //draw_circle_spi(cx, cy, radius, 30.0f);
+                } else {
+                    printf("KEYPAD: Invalid plotter limits\n");
+                }
+            } else {
+                printf("KEYPAD: Need calibration and homing first!\n");
+            }
             break;
 
-        case '4':  // Stop SPI streaming
-            printf("KEYPAD: Stopping SPI stream\n");
-            stop_spi_stream();
-            break;
-            
-        case '5':
-            printf("KEYPAD: Drawing circle via SPI\n");
-            if (plotter.x_max > 0 && plotter.y_max > 0) {
-                float cx = plotter.x_max / 2.0f;
-                float cy = plotter.y_max / 2.0f;
-                float radius = fminf(plotter.x_max, plotter.y_max) / 4.0f;
-                draw_circle_spi(cx, cy, radius, 20.0f);
+        case '4':  // Простой тест - движение по квадрату
+            printf("KEYPAD: Testing simple square movement\n");
+            if (plotter.is_calibrated && plotter.is_homed) {
+                // Простое движение по квадрату через G-код
+                sprintf(params, "X%d,Y%d", 50, 50);
+                send_to_stm32_cmd(CMD_G1_LINEAR, params);
             }
             break;
             
@@ -1045,53 +1083,73 @@ void process_keypad_command(char key) {
 
 // ============ SPI Initialization ============
 
-static void stm32_spi_init(void) {
-    // Configure READY pin as input
+static void stm32_spi_init(void)
+{
+    printf("\n=== STM32 SPI INITIALIZATION ===\n");
+    // Configure READY pin as input with pull-down
     gpio_config_t ready_conf = {
         .pin_bit_mask = (1ULL << STM32_READY_PIN),
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLDOWN_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE};
     gpio_config(&ready_conf);
-    
-    // Initialize SPI bus (if not already done)
+    printf("READY pin (GPIO%d) configured as input with pull-down\n", STM32_READY_PIN);
+
+    // Test READY pin
+    int ready_state = gpio_get_level(STM32_READY_PIN);
+    printf("Initial READY pin state: %d\n", ready_state);
+
+    // Initialize SPI bus
     spi_bus_config_t buscfg = {
         .mosi_io_num = STM32_SPI_MOSI,
         .miso_io_num = STM32_SPI_MISO,
         .sclk_io_num = STM32_SPI_CLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = SPI_CHUNK_SIZE
-    };
-    
+        .max_transfer_sz = 2048,
+        .flags = SPICOMMON_BUSFLAG_MASTER};
+
     esp_err_t ret = spi_bus_initialize(STM32_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
-    if (ret != ESP_OK) {
-        printf("SPI bus init failed: %s\n", esp_err_to_name(ret));
+    if (ret != ESP_OK)
+    {
+        printf("ERROR: SPI bus init failed: %s\n", esp_err_to_name(ret));
         return;
     }
-    
+    printf("SPI bus initialized successfully\n");
+
     // Add STM32 as SPI device
     spi_device_interface_config_t devcfg = {
         .command_bits = 0,
         .address_bits = 0,
-        .mode = 0,                      // SPI mode 0 (CPOL=0, CPHA=0)
-        .clock_speed_hz = 2*1000*1000,  // 2 MHz
+        .mode = 0,                         // SPI mode 0 (CPOL=0, CPHA=0)
+        .duty_cycle_pos = 128,             // 50% duty cycle
+        .cs_ena_pretrans = 2,              // Setup time before transmission
+        .cs_ena_posttrans = 2,             // Hold time after transmission
+        .clock_speed_hz = 1 * 1000 * 1000, // 1 MHz (reduced for stability)
+        .input_delay_ns = 0,
         .spics_io_num = STM32_SPI_CS,
-        .queue_size = 1,
         .flags = 0,
+        .queue_size = 1,
         .pre_cb = NULL,
-        .post_cb = NULL
-    };
-    
+        .post_cb = NULL};
+
     ret = spi_bus_add_device(STM32_SPI_HOST, &devcfg, &stm32_spi);
-    if (ret != ESP_OK) {
-        printf("Failed to add SPI device: %s\n", esp_err_to_name(ret));
+    if (ret != ESP_OK)
+    {
+        printf("ERROR: Failed to add SPI device: %s\n", esp_err_to_name(ret));
         return;
     }
-    
-    printf("SPI initialized for STM32 communication\n");
+
+    printf("STM32 SPI device added successfully\n");
+    printf("Configuration:\n");
+    printf("  MOSI: GPIO%d\n", STM32_SPI_MOSI);
+    printf("  MISO: GPIO%d\n", STM32_SPI_MISO);
+    printf("  CLK:  GPIO%d\n", STM32_SPI_CLK);
+    printf("  CS:   GPIO%d\n", STM32_SPI_CS);
+    printf("  READY: GPIO%d\n", STM32_READY_PIN);
+    printf("  Speed: 1 MHz\n");
+    printf("  Mode: 0 (CPOL=0, CPHA=0)\n");
 }
 
 void app_main() {
@@ -1122,13 +1180,13 @@ void app_main() {
         .queue_size = 7
     };
     
-    spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
-    spi_bus_add_device(SPI2_HOST, &devcfg, &spi);
-    
+    stm32_spi_init();
+
+    printf("init spi2_host for OLED");
     // Initialize OLED display
-    u8g2_Setup_ssd1309_128x64_noname0_f(&u8g2, U8G2_R0, u8x8_byte_hw_spi, u8x8_gpio_and_delay);
-    u8g2_InitDisplay(&u8g2);
-    u8g2_SetPowerSave(&u8g2, 0);
+    // u8g2_Setup_ssd1309_128x64_noname0_f(&u8g2, U8G2_R0, u8x8_byte_hw_spi, u8x8_gpio_and_delay);
+    // u8g2_InitDisplay(&u8g2);
+    // u8g2_SetPowerSave(&u8g2, 0);
     
     // Initialize UART to STM32
     uart_config_t uart_config = {
@@ -1145,6 +1203,7 @@ void app_main() {
     uart_set_pin(STM32_UART_PORT, STM32_TX_PIN, STM32_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     
     printf("UART2 configured: TX=GPIO%d, RX=GPIO%d\n", STM32_TX_PIN, STM32_RX_PIN);
+
     
     // Start tasks with proper priorities
     xTaskCreate(stm32_uart_task, "stm32_uart", 4096, NULL, 5, NULL);
@@ -1154,7 +1213,7 @@ void app_main() {
     
     // Main display loop - reduced delay for more responsive display
     while (1) {
-        update_display();
+        //update_display();
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
