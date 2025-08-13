@@ -9,15 +9,27 @@
 #include "shared/cmd_ids.h"
 #include <math.h>
 
+#include "driver/spi_master.h"
+
+// SPI Stream state
+typedef struct {
+    uint8_t active;
+    uint8_t *tx_buffer;
+    size_t tx_size;
+    TaskHandle_t sender_task;
+} spi_stream_t;
+
+static spi_stream_t spi_stream = {0};
+
+// SPI Configuration for STM32 communication
+#define STM32_SPI_HOST    HSPI_HOST
+#define STM32_SPI_MOSI    13   // GPIO13
+#define STM32_SPI_MISO    12   // GPIO12 (not used but connected)
+#define STM32_SPI_CLK     14   // GPIO14
+#define STM32_SPI_CS      15   // GPIO15
+#define STM32_READY_PIN   21   // GPIO21 - READY signal from STM32
 // =============================== TEST STREAMING BEGIN 1 ===================================
 // --- Streaming protocol (must match STM32) ---
-#define STREAM_SYNC0      0xA5
-#define STREAM_SYNC1      0x5A
-#define STREAM_CMD_BEGIN  0x10
-#define STREAM_CMD_DATA   0x11
-#define STREAM_CMD_START  0x12
-#define STREAM_CMD_ABORT  0x13
-
 #ifndef CHUNK
 // Размер кусочка DATA-пейлоада; 512 оптимально (низкий overhead).
 #define CHUNK 512
@@ -49,6 +61,9 @@
 #define HEARTBEAT_PERIOD_MS    1000
 #define CONNECT_TIMEOUT_MS     3000
 
+
+static spi_device_handle_t stm32_spi = NULL;
+
 // CRC16-CCITT (0xFFFF, poly 0x1021), как на STM32
 static inline uint16_t crc16_ccitt(uint16_t crc, uint8_t b) {
     crc ^= (uint16_t)b << 8;
@@ -57,13 +72,16 @@ static inline uint16_t crc16_ccitt(uint16_t crc, uint8_t b) {
     }
     return crc;
 }
+
+static void spi_send_nibbles(const uint8_t *data, size_t len);
+
 // =============================== TEST STREAMING END 1 ===================================
 
 
 const char* command_names[CMD_COUNT] = {
     "INVALID",
     "HOME",
-    "CALIBRATE",
+    "CALIBRATE", 
     "EMERGENCY_STOP",
     "MOVE_TO",
     "G0_RAPID",
@@ -75,6 +93,8 @@ const char* command_names[CMD_COUNT] = {
     "SET_PEN",
     "SET_COLOR",
     "GET_COLOR",
+    "DRAW_BEGIN",
+    "DRAW_FINISH_WHEN_EMPTY",
     "DUMMY_ACTIVE_COMMANDS_DELIMITER",
     "HEARTBEAT",
     "GET_STATUS",
@@ -89,7 +109,7 @@ const char* command_names[CMD_COUNT] = {
     "GET_DIAGNOSTICS",
     "GET_CMD_STATUS",
     "G90_ABSOLUTE",
-    "G91_RELATIVE"    
+    "G91_RELATIVE"
 };
 
 // Hardware pins for OLED
@@ -116,15 +136,14 @@ const char* command_names[CMD_COUNT] = {
 static uint8_t stream_pkt[STREAM_PKT_BYTES];
 
 // GPIO пины для клавиатуры (можно изменить под вашу схему)
-static const int row_pins[KEYPAD_ROWS] = {32, 33, 27, 2}; // Выходы (строки)
-static const int col_pins[KEYPAD_COLS] = {22, 21, 19, 4};  // Входы (столбцы)
+static const int row_pins[KEYPAD_ROWS] = {32, 33, 27}; // Выходы (строки)
+static const int col_pins[KEYPAD_COLS] = {22, 4, 19};  // Входы (столбцы)
 
 // Матрица символов клавиатуры
 static const char keypad_keys[KEYPAD_ROWS][KEYPAD_COLS] = {
-    {'1', '2', '3', 'A'},
-    {'4', '5', '6', 'B'},
-    {'7', '8', '9', 'C'},
-    {'*', '0', '#', 'D'}
+    {'1', '2', '3'},
+    {'4', '5', '6'},
+    {'7', '8', '9'}
 };
 
 // Состояние клавиатуры
@@ -133,27 +152,6 @@ static uint32_t last_key_time = 0;
 
 static spi_device_handle_t spi;
 static u8g2_t u8g2;
-
-typedef struct {
-    uint8_t active;
-    uint8_t *buffer;
-    size_t buffer_size;
-    size_t write_pos;
-    size_t read_pos;
-    size_t total_sent;
-    size_t total_generated;
-    uint8_t generation_complete;
-    TaskHandle_t generator_task;
-    TaskHandle_t sender_task;
-    SemaphoreHandle_t buffer_mutex;
-    SemaphoreHandle_t data_ready_sem;
-    
-    uint8_t stream_ending;      // Флаг завершения потока
-    uint8_t request_pending;    // Флаг ожидания запроса
-    uint8_t continuous_mode;    // Флаг непрерывного режима    
-} continuous_stream_t;
-
-static continuous_stream_t cont_stream = {0};
 
 typedef struct {
 	uint32_t request_id;
@@ -216,13 +214,6 @@ static plotter_state_t plotter = {
 static uint32_t request_counter = 1;
 static SemaphoreHandle_t display_mutex;
 
-#define STREAM_SYNC0      0xA5
-#define STREAM_SYNC1      0x5A
-#define STREAM_CMD_BEGIN  0x10  // meta: f_hz, step_us, guard_us, inv_mask
-#define STREAM_CMD_DATA   0x11  // payload: packed nibbles (2 ticks per byte)
-#define STREAM_CMD_START  0x12  // start playback
-#define STREAM_CMD_ABORT  0x13  // abort playback
-
 typedef struct {
     uint32_t f_hz;       // sample rate, e.g. 10000
     uint16_t step_us;    // STEP high width
@@ -235,581 +226,89 @@ uint32_t send_to_stm32_cmd(command_id_t cmd_id, const char* params);
 static bool wait_command_completion(uint32_t request_id, const char* step_name, uint32_t timeout_ms);
 
 // =============================== TEST STREAMING BEGIN 1 ===================================
-// --- Low-level: отправка одного бинарного кадра STREAM_* ---
-static void stream_send_frame(uint8_t cmd, const uint8_t *payload, uint16_t len)
-{
-    uint8_t hdr[5];
-    hdr[0] = STREAM_SYNC0;
-    hdr[1] = STREAM_SYNC1;
-    hdr[2] = cmd;
-    hdr[3] = (uint8_t)(len & 0xFF);
-    hdr[4] = (uint8_t)(len >> 8);
-
-    // CRC только по payload (как на STM32)
-    uint16_t crc = 0xFFFF;
-    for (uint16_t i=0;i<len;i++) crc = crc16_ccitt(crc, payload[i]);
-
-    uint8_t tail[2];
-    tail[0] = (uint8_t)(crc >> 8);   // CRC hi
-    tail[1] = (uint8_t)(crc & 0xFF); // CRC lo
-
-    uart_write_bytes(STM32_UART_PORT, (const char*)hdr, sizeof(hdr));
-    if (len) uart_write_bytes(STM32_UART_PORT, (const char*)payload, len);
-    uart_write_bytes(STM32_UART_PORT, (const char*)tail, sizeof(tail));
-    // без \n — это бинарь
-}
-
-static inline void stream_begin(uint32_t f_hz, uint16_t step_us, uint16_t guard_us, uint8_t inv_mask)
-{
-    uint8_t pl[9];
-    pl[0] = (uint8_t)(f_hz & 0xFF);
-    pl[1] = (uint8_t)((f_hz >> 8) & 0xFF);
-    pl[2] = (uint8_t)((f_hz >> 16) & 0xFF);
-    pl[3] = (uint8_t)((f_hz >> 24) & 0xFF);
-    pl[4] = (uint8_t)(step_us & 0xFF);
-    pl[5] = (uint8_t)(step_us >> 8);
-    pl[6] = (uint8_t)(guard_us & 0xFF);
-    pl[7] = (uint8_t)(guard_us >> 8);
-    pl[8] = inv_mask;
-    stream_send_frame(STREAM_CMD_BEGIN, pl, sizeof(pl));
-}
-
-static inline void stream_data(const uint8_t *buf, uint16_t len)
-{
-    if (len) stream_send_frame(STREAM_CMD_DATA, buf, len);
-}
-
-static inline void stream_start(void)
-{
-    stream_send_frame(STREAM_CMD_START, NULL, 0);
-}
-
-static inline void stream_abort(void)
-{
-    stream_send_frame(STREAM_CMD_ABORT, NULL, 0);
-}
 // =============================== TEST STREAMING END 1 ===================================
 
 // =============================== TEST STREAMING BEGIN 2 ===================================
-// Собирает байт тика: low nibble = STEP/DIR; high nibble = те же STEP-биты (опустить импульс)
-static inline uint8_t make_tick_byte(uint8_t x_step, uint8_t x_dir_pos, uint8_t y_step, uint8_t y_dir_pos)
-{
-    uint8_t low = 0;
-    if (x_step) low |= 0x01;
-    if (x_dir_pos) low |= 0x02;
-    if (y_step) low |= 0x04;
-    if (y_dir_pos) low |= 0x08;
-
-    uint8_t high = 0;
-    if (x_step) high |= 0x10;  // X_STEP в старшем полубайте
-    if (y_step) high |= 0x40;  // Y_STEP в старшем полубайте (bit6)
-
-    return (uint8_t)(low | high);
-}
-
-// Пейсинг для недопущения переполнения кольца на STM32
-static inline void paced_delay_for_bytes(uint32_t bytes_sent_after_start)
-{
-    // реальная полезная пропускная = STREAM_BYTES_PER_SEC * 0.98
-    const uint32_t bps = (STREAM_BYTES_PER_SEC * STREAM_RATE_SAFETY_PC) / 100; // ~4900 Б/с
-    // мы ждём после каждого кадра на CHUNK байт ~ CHUNK/bps секунд:
-    // делать здесь нечего; задержка делается в месте отправки кадра
-    (void)bytes_sent_after_start;
-}
-
-// Генерация круга, отправка DATA, START и пейсинг
-static void stream_generate_circle_and_send(float cx_mm, float cy_mm, float R_mm, float speed_mm_s)
-{
-    // 0) Подготовка параметров
-    const float spm = STEPS_PER_MM;
-    const float two_pi = 6.28318530717958647692f;
-    const float L_mm = two_pi * R_mm;               // длина окружности
-    const float T_s  = (speed_mm_s > 0.1f) ? (L_mm / speed_mm_s) : 0.0f;
-    const uint32_t N = (uint32_t)ceilf(T_s * (float)STREAM_F_HZ); // кол-во сэмплов (байтов)
-
-    if (N == 0) return;
-
-    // 1) BEGIN
-    stream_begin(STREAM_F_HZ, STREAM_STEP_US, STREAM_GUARD_US, STREAM_INV_MASK);
-
-    // 2) Генерим данные и отправляем: часть ДО START (preload), остальное — c пейсингом
-    uint8_t buf[STREAM_DATA_CHUNK];
-    uint32_t in_buf = 0;
-    uint32_t sent_total = 0;
-
-    // приращение угла за тик: omega = v/R; dtheta = omega / f
-    const float dtheta = (R_mm > 0.001f) ? ((speed_mm_s / R_mm) / (float)STREAM_F_HZ) : 0.0f;
-
-    float theta = 0.0f;
-    float acc_x = 0.0f, acc_y = 0.0f;  // накопители дробных шагов (в шагах)
-    // шаги/тик в проекции: dx = -R*sin(theta)*dtheta; dy = R*cos(theta)*dtheta
-    for (uint32_t i=0; i<N; i++) {
-        float dx_mm = -R_mm * sinf(theta) * dtheta;
-        float dy_mm =  R_mm * cosf(theta) * dtheta;
-
-        acc_x += dx_mm * spm;
-        acc_y += dy_mm * spm;
-
-        uint8_t x_step=0, x_dir_pos=0, y_step=0, y_dir_pos=0;
-
-        if (acc_x >= 1.0f) { x_step=1; x_dir_pos=1; acc_x -= 1.0f; }
-        else if (acc_x <= -1.0f) { x_step=1; x_dir_pos=0; acc_x += 1.0f; }
-
-        if (acc_y >= 1.0f) { y_step=1; y_dir_pos=1; acc_y -= 1.0f; }
-        else if (acc_y <= -1.0f) { y_step=1; y_dir_pos=0; acc_y += 1.0f; }
-
-        buf[in_buf++] = make_tick_byte(x_step, x_dir_pos, y_step, y_dir_pos);
-
-        if (in_buf == STREAM_DATA_CHUNK) {
-            stream_data(buf, (uint16_t)in_buf);
-            sent_total += in_buf;
-            in_buf = 0;
-
-            // Если уже отправили START — держим среднюю скорость отправки ~ потреблению (чтобы не забить 4К-буфер STM32)
-            if (sent_total > STREAM_PRELOAD_BYTES) {
-                // 500 байт при ~4900 Б/с => ~102 мс
-                uint32_t ms = (STREAM_DATA_CHUNK * 1000u) / ((STREAM_BYTES_PER_SEC * STREAM_RATE_SAFETY_PC)/100u);
-                vTaskDelay(pdMS_TO_TICKS(ms));
-            }
-        }
-
-        theta += dtheta;
-        if (theta >= two_pi) theta -= two_pi; // не обязательно, но полезно для численной устойчивости
-
-        // Отправляем START ровно один раз, когда накопили preload
-        if (sent_total >= STREAM_PRELOAD_BYTES && sent_total - in_buf < STREAM_PRELOAD_BYTES) {
-            // START будет вызван после первой отправки, которая преодолеет порог preload;
-            // фактически — при следующем stream_data (см. выше)
-        }
-    }
-
-    // добросить «хвост»
-    if (in_buf) {
-        stream_data(buf, (uint16_t)in_buf);
-        sent_total += in_buf;
-        in_buf = 0;
-    }
-
-    // 3) Теперь жмём START (если ещё не жали): простой способ — нажать после первой отправки >0 байт
-    // Чтобы начать воспроизведение сразу после прелоада — жмём START здесь, если sent_total >= preload
-    stream_start();
-
-    // 4) Досылаем остаток с пейсингом уже отправили выше; здесь остаётся просто подождать теоретическое время T_s
-    // плюс небольшой запас, чтобы STM32 доиграл последние байты
-    uint32_t wait_ms = (uint32_t)(T_s * 1000.0f) + 150;
-    vTaskDelay(pdMS_TO_TICKS(wait_ms));
-}
 // =============================== TEST STREAMING END 2 ===================================
 
 // =============================== TEST STREAMING BEGIN 2 ===================================
-static void stream_circle_task(void *pv)
-{
-    // 1) Получить лимиты (если ещё не знаем)
-    if (plotter.x_max == 0.0f || plotter.y_max == 0.0f) {
-        send_to_stm32_cmd(CMD_GET_LIMITS, NULL);
-        uint32_t t0 = xTaskGetTickCount();
-        while ((plotter.x_max == 0.0f || plotter.y_max == 0.0f) &&
-               (xTaskGetTickCount() - t0) < pdMS_TO_TICKS(3000)) {
-            vTaskDelay(pdMS_TO_TICKS(50));
-        }
-        if (plotter.x_max == 0.0f || plotter.y_max == 0.0f) {
-            printf("STREAM: no limits -> abort\n");
-            vTaskDelete(NULL);
-            return;
-        }
-    }
-
-    const float margin = 2.0f;
-    const float x_max = plotter.x_max, y_max = plotter.y_max;
-    const float shorter = (x_max < y_max) ? x_max : y_max;
-    const float D = shorter - 2*margin;        // базовый диаметр
-    const float R = D * 0.5f;                   // радиус
-    const float cx = x_max * 0.5f;              // центр
-    const float cy = y_max * 0.5f;
-    const float speed = 40.0f;                  // мм/с по окружности (консервативно)
-
-    // 2) Перо вверх
-    uint32_t rid = send_to_stm32_cmd(CMD_PEN_UP, NULL);
-    wait_command_completion(rid, "PEN_UP", 8000);
-
-    // 3) В центр (G0), затем к старту (угол 0 => (cx+R, cy))
-    char p[64];
-    sprintf(p, "X%.2f,Y%.2f", cx, cy);
-    rid = send_to_stm32_cmd(CMD_G0_RAPID, p);
-    if (!wait_command_completion(rid, "G0 center", 15000)) {
-        vTaskDelete(NULL); return;
-    }
-
-    sprintf(p, "X%.2f,Y%.2f", cx + R, cy);
-    rid = send_to_stm32_cmd(CMD_G0_RAPID, p);
-    if (!wait_command_completion(rid, "G0 start", 15000)) {
-        vTaskDelete(NULL); return;
-    }
-
-    // 4) Перо вниз (не обязательно, можно и без контакта для отладки)
-    rid = send_to_stm32_cmd(CMD_PEN_DOWN, NULL);
-    wait_command_completion(rid, "PEN_DOWN", 8000);
-    vTaskDelay(pdMS_TO_TICKS(150));
-
-    // 5) Генерация и отправка круга по стриму
-    printf("STREAM: circle R=%.2f mm, center=(%.2f,%.2f)\n", R, cx, cy);
-    stream_generate_circle_and_send(cx, cy, R, speed);
-
-    // 6) Перо вверх
-    rid = send_to_stm32_cmd(CMD_PEN_UP, NULL);
-    wait_command_completion(rid, "PEN_UP end", 8000);
-
-    vTaskDelete(NULL);
-}
-// =============================== STREAMING FNCs ===================================
-
-// Initialize continuous streaming
-static void continuous_stream_init(void) {
-    if (cont_stream.buffer) {
-        free(cont_stream.buffer);
-    }
+void draw_circle_spi(float cx_mm, float cy_mm, float radius_mm, float speed_mm_s) {
+    const int segments = 72;
+    const float angle_step = 2.0f * M_PI / segments;
     
-    cont_stream.buffer = malloc(CONTINUOUS_BUFFER_SIZE);
-    cont_stream.buffer_size = CONTINUOUS_BUFFER_SIZE;
-    cont_stream.write_pos = 0;
-    cont_stream.read_pos = 0;
-    cont_stream.total_sent = 0;
-    cont_stream.total_generated = 0;
-    cont_stream.generation_complete = 0;
-    cont_stream.active = 1;
-    cont_stream.stream_ending = 0;
-    cont_stream.request_pending = 0;
-    cont_stream.continuous_mode = 1;  // Устанавливаем режим
+    // Prepare nibbles buffer
+    size_t buffer_size = segments * 100;  // Rough estimate
+    uint8_t *nibbles = malloc(buffer_size);
+    if (!nibbles) return;
     
-    if (!cont_stream.buffer_mutex) {
-        cont_stream.buffer_mutex = xSemaphoreCreateMutex();
-    }
-    if (!cont_stream.data_ready_sem) {
-        cont_stream.data_ready_sem = xSemaphoreCreateBinary();
-    }
-}
-
-// Clean up continuous streaming
-static void continuous_stream_cleanup(void) {
-    cont_stream.active = 0;
-    
-    // Даем время задаче завершиться самостоятельно
-    if (cont_stream.generator_task) {
-        // Ждем, пока задача сама завершится
-        vTaskDelay(pdMS_TO_TICKS(100));
-        
-        // Проверяем, удалилась ли задача сама
-        if (cont_stream.generator_task) {
-            vTaskDelete(cont_stream.generator_task);
-        }
-        cont_stream.generator_task = NULL;
-    }
-    
-    if (cont_stream.sender_task) {
-        vTaskDelete(cont_stream.sender_task);
-        cont_stream.sender_task = NULL;
-    }
-    
-    // Очищаем буфер после небольшой задержки
-    vTaskDelay(pdMS_TO_TICKS(50));
-    
-    if (cont_stream.buffer) {
-        free(cont_stream.buffer);
-        cont_stream.buffer = NULL;
-    }
-    
-    // Сбрасываем все поля структуры
-    cont_stream.buffer_size = 0;
-    cont_stream.write_pos = 0;
-    cont_stream.read_pos = 0;
-    cont_stream.total_sent = 0;
-    cont_stream.total_generated = 0;
-    cont_stream.generation_complete = 0;
-    cont_stream.stream_ending = 0;
-    cont_stream.request_pending = 0;
-    cont_stream.continuous_mode = 0;
-}
-
-// Generate continuous pattern (example: spiral)
-static void continuous_spiral_generator(void *pvParams) {
-    float cx_mm = plotter.x_max / 2.0f;
-    float cy_mm = plotter.y_max / 2.0f;
-    float max_r = fminf(plotter.x_max, plotter.y_max) / 2.0f - 5.0f;
-    float r = 5.0f;  // Start radius
-    float theta = 0.0f;
-    float r_increment = 0.5f;  // Spiral tightness
-    float theta_increment = 0.1f;  // Angular resolution
-    
-    float acc_x = 0.0f, acc_y = 0.0f;
-    float prev_x = cx_mm + r;
+    size_t nibble_count = 0;
+    float acc_x = 0, acc_y = 0;
+    float prev_x = cx_mm + radius_mm;
     float prev_y = cy_mm;
     
-    printf("SPIRAL: Generating continuous spiral pattern\n");
-    
-    while (cont_stream.active && r < max_r) {
-        // Calculate next point
-        float x = cx_mm + r * cosf(theta);
-        float y = cy_mm + r * sinf(theta);
+    // Generate nibbles for circle
+    for (int i = 1; i <= segments; i++) {
+        float angle = angle_step * i;
+        float x = cx_mm + radius_mm * cosf(angle);
+        float y = cy_mm + radius_mm * sinf(angle);
         
-        // Calculate steps
         float dx_mm = x - prev_x;
         float dy_mm = y - prev_y;
         
         acc_x += dx_mm * STEPS_PER_MM;
         acc_y += dy_mm * STEPS_PER_MM;
         
-        uint8_t x_step = 0, x_dir = 0, y_step = 0, y_dir = 0;
-        
-        if (acc_x >= 1.0f) {
-            x_step = 1; x_dir = 1;
-            acc_x -= 1.0f;
-        } else if (acc_x <= -1.0f) {
-            x_step = 1; x_dir = 0;
-            acc_x += 1.0f;
-        }
-        
-        if (acc_y >= 1.0f) {
-            y_step = 1; y_dir = 1;
-            acc_y -= 1.0f;
-        } else if (acc_y <= -1.0f) {
-            y_step = 1; y_dir = 0;
-            acc_y += 1.0f;
-        }
-        
-        // Create nibble
-        uint8_t nib = 0;
-        if (x_step) nib |= 0x01;
-        if (x_dir) nib |= 0x02;
-        if (y_step) nib |= 0x04;
-        if (y_dir) nib |= 0x08;
-        
-        // Wait for space in buffer
-        while (1) {
-            xSemaphoreTake(cont_stream.buffer_mutex, portMAX_DELAY);
-            size_t used = (cont_stream.write_pos >= cont_stream.read_pos) ?
-                         (cont_stream.write_pos - cont_stream.read_pos) :
-                         (CONTINUOUS_BUFFER_SIZE - cont_stream.read_pos + cont_stream.write_pos);
+        // Generate steps
+        while (fabsf(acc_x) >= 1.0f || fabsf(acc_y) >= 1.0f) {
+            uint8_t nib = 0;
             
-            if (used < CONTINUOUS_BUFFER_SIZE - 2) {
-                // Pack two nibbles per byte
-                static uint8_t byte_buffer = 0;
-                static int nibble_count = 0;
-                
-                if (nibble_count == 0) {
-                    byte_buffer = nib;
-                    nibble_count = 1;
-                } else {
-                    byte_buffer |= (nib << 4);
-                    cont_stream.buffer[cont_stream.write_pos] = byte_buffer;
-                    cont_stream.write_pos = (cont_stream.write_pos + 1) % CONTINUOUS_BUFFER_SIZE;
-                    cont_stream.total_generated++;
-                    nibble_count = 0;
-                    
-                    // Signal data available
-                    xSemaphoreGive(cont_stream.data_ready_sem);
-                }
-                
-                xSemaphoreGive(cont_stream.buffer_mutex);
-                break;
+            if (acc_x >= 1.0f) {
+                nib |= NIBBLE_X_STEP | NIBBLE_X_DIR;
+                acc_x -= 1.0f;
+            } else if (acc_x <= -1.0f) {
+                nib |= NIBBLE_X_STEP;
+                acc_x += 1.0f;
             }
-            xSemaphoreGive(cont_stream.buffer_mutex);
-            vTaskDelay(pdMS_TO_TICKS(10));
+            
+            if (acc_y >= 1.0f) {
+                nib |= NIBBLE_Y_STEP | NIBBLE_Y_DIR;
+                acc_y -= 1.0f;
+            } else if (acc_y <= -1.0f) {
+                nib |= NIBBLE_Y_STEP;
+                acc_y += 1.0f;
+            }
+            
+            // Pack two nibbles per byte
+            if (nibble_count % 2 == 0) {
+                nibbles[nibble_count/2] = nib;
+            } else {
+                nibbles[nibble_count/2] |= (nib << 4);
+            }
+            nibble_count++;
+            
+            if (nibble_count >= buffer_size * 2) break;
         }
         
         prev_x = x;
         prev_y = y;
-        
-        // Update spiral
-        theta += theta_increment;
-        if (theta >= 2 * M_PI) {
-            theta -= 2 * M_PI;
-            r += r_increment;
-        }
     }
     
-    cont_stream.generation_complete = 1;
-    printf("SPIRAL: Generation complete, total bytes: %zu\n", cont_stream.total_generated);
-
-    // Безопасное завершение
-    xSemaphoreTake(cont_stream.buffer_mutex, portMAX_DELAY);
-    TaskHandle_t temp_handle = cont_stream.generator_task;
-    cont_stream.generator_task = NULL;  // Сбрасываем handle ДО удаления
-    xSemaphoreGive(cont_stream.buffer_mutex);
+    // Start SPI stream
+    send_to_stm32_cmd(CMD_DRAW_BEGIN, NULL);
+    vTaskDelay(pdMS_TO_TICKS(100));
     
-    vTaskDelete(temp_handle ? temp_handle : NULL);  // Удаляем себя через сохраненный handle
+    // Send nibbles via SPI
+    size_t bytes_to_send = (nibble_count + 1) / 2;
+    spi_send_nibbles(nibbles, bytes_to_send);
+    
+    // Wait for movement to complete
+    vTaskDelay(pdMS_TO_TICKS(5000));  // Adjust based on circle size
+    
+    // Finish stream
+    send_to_stm32_cmd(CMD_DRAW_FINISH_WHEN_EMPTY, NULL);
+    
+    free(nibbles);
 }
-
-static void handle_stream_request(uint16_t requested_bytes) {
-    if (!cont_stream.active) return;
-
-    printf("STREAM_REQ: STM32 requested %u bytes\n", requested_bytes);
-
-    xSemaphoreTake(cont_stream.buffer_mutex, portMAX_DELAY);
-
-    size_t available = (cont_stream.write_pos >= cont_stream.read_pos) ?
-                       (cont_stream.write_pos - cont_stream.read_pos) :
-                       (CONTINUOUS_BUFFER_SIZE - cont_stream.read_pos + cont_stream.write_pos);
-
-    if (available == 0) {
-        if (cont_stream.generation_complete && !cont_stream.stream_ending) {
-            // Отправляем END с правильным CRC
-            cont_stream.stream_ending = 1;  // Устанавливаем флаг
-            
-            // Формируем бинарный кадр END
-            uint8_t end_frame[7];
-            end_frame[0] = STREAM_SYNC0;
-            end_frame[1] = STREAM_SYNC1;
-            end_frame[2] = STREAM_CMD_END;
-            end_frame[3] = 0x00;  // Len low
-            end_frame[4] = 0x00;  // Len high
-            
-            // CRC для пустого payload
-            uint16_t crc = 0xFFFF;
-            end_frame[5] = (uint8_t)(crc >> 8);   // CRC hi
-            end_frame[6] = (uint8_t)(crc & 0xFF); // CRC lo
-            
-            xSemaphoreGive(cont_stream.buffer_mutex);
-            
-            // Отправляем бинарный кадр
-            uart_write_bytes(STM32_UART_PORT, (const char*)end_frame, 7);
-            uart_wait_tx_done(STM32_UART_PORT, pdMS_TO_TICKS(100));
-            
-            printf("STREAM_REQ: Sent END signal (no data, generation complete)\n");
-            
-            // Задержка перед cleanup
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continuous_stream_cleanup();
-            return;
-        } else {
-            printf("STREAM_REQ: No data available yet\n");
-            cont_stream.request_pending = 0;  // Сбрасываем флаг
-            xSemaphoreGive(cont_stream.buffer_mutex);
-            return;
-        }
-    }
-
-    // Есть что отправлять
-    size_t to_send = (available < requested_bytes) ? available : requested_bytes;
-
-    uint8_t *chunk = malloc(CONTINUOUS_CHUNK_SIZE);
-    if (chunk == NULL) {
-        printf("STREAM_REQ: ERROR - malloc failed for chunk!\n");
-        xSemaphoreGive(cont_stream.buffer_mutex);
-        return;
-    }
-
-    size_t sent = 0;
-    while (sent < to_send) {
-        size_t chunk_size = ((to_send - sent) < CONTINUOUS_CHUNK_SIZE) ?
-                            (to_send - sent) : CONTINUOUS_CHUNK_SIZE;
-
-        for (size_t i = 0; i < chunk_size; i++) {
-            chunk[i] = cont_stream.buffer[cont_stream.read_pos];
-            cont_stream.read_pos = (cont_stream.read_pos + 1) % CONTINUOUS_BUFFER_SIZE;
-        }
-
-        stream_send_frame(STREAM_CMD_DATA, chunk, chunk_size);
-        sent += chunk_size;
-        cont_stream.total_sent += chunk_size;
-    }
-
-    printf("STREAM_REQ: Sent %zu bytes (total: %zu)\n", sent, cont_stream.total_sent);
-    free(chunk);
-
-    // Проверяем, нужно ли отправить END
-    size_t available_after = (cont_stream.write_pos >= cont_stream.read_pos) ?
-                             (cont_stream.write_pos - cont_stream.read_pos) :
-                             (CONTINUOUS_BUFFER_SIZE - cont_stream.read_pos + cont_stream.write_pos);
-
-    bool partial_fulfill = (sent < (size_t)requested_bytes);
-    if ((partial_fulfill || available_after == 0) && cont_stream.generation_complete && !cont_stream.stream_ending) {
-        cont_stream.stream_ending = 1;
-        
-        // Отправляем END
-        uint8_t end_frame[7];
-        end_frame[0] = STREAM_SYNC0;
-        end_frame[1] = STREAM_SYNC1;
-        end_frame[2] = STREAM_CMD_END;
-        end_frame[3] = 0x00;
-        end_frame[4] = 0x00;
-        uint16_t crc = 0xFFFF;
-        end_frame[5] = (uint8_t)(crc >> 8);
-        end_frame[6] = (uint8_t)(crc & 0xFF);
-        
-        xSemaphoreGive(cont_stream.buffer_mutex);
-        
-        uart_write_bytes(STM32_UART_PORT, (const char*)end_frame, 7);
-        uart_wait_tx_done(STM32_UART_PORT, pdMS_TO_TICKS(100));
-        
-        printf("STREAM_REQ: Sent END signal\n");
-        
-        vTaskDelay(pdMS_TO_TICKS(100));
-        continuous_stream_cleanup();
-        return;
-    }
-
-    cont_stream.request_pending = 0;  // Сбрасываем флаг запроса
-    xSemaphoreGive(cont_stream.buffer_mutex);
-}
-
-// // Handle data request from STM32
-// static void handle_stream_request(uint16_t requested_bytes) {
-//     if (!cont_stream.active) return;
-    
-//     printf("STREAM_REQ: STM32 requested %u bytes\n", requested_bytes);
-    
-//     xSemaphoreTake(cont_stream.buffer_mutex, portMAX_DELAY);
-    
-//     size_t available = (cont_stream.write_pos >= cont_stream.read_pos) ?
-//                       (cont_stream.write_pos - cont_stream.read_pos) :
-//                       (CONTINUOUS_BUFFER_SIZE - cont_stream.read_pos + cont_stream.write_pos);
-    
-//     size_t to_send = (available < requested_bytes) ? available : requested_bytes;
-    
-//     if (to_send > 0) {
-//         // Allocate chunk on heap instead of stack to prevent overflow
-//         uint8_t *chunk = malloc(CONTINUOUS_CHUNK_SIZE);
-//         if (chunk == NULL) {
-//             printf("STREAM_REQ: ERROR - malloc failed for chunk!\n");
-//             xSemaphoreGive(cont_stream.buffer_mutex);
-//             return;
-//         }
-        
-//         size_t sent = 0;
-        
-//         while (sent < to_send) {
-//             size_t chunk_size = (to_send - sent < CONTINUOUS_CHUNK_SIZE) ? 
-//                                (to_send - sent) : CONTINUOUS_CHUNK_SIZE;
-            
-//             // Copy from circular buffer
-//             for (size_t i = 0; i < chunk_size; i++) {
-//                 chunk[i] = cont_stream.buffer[cont_stream.read_pos];
-//                 cont_stream.read_pos = (cont_stream.read_pos + 1) % CONTINUOUS_BUFFER_SIZE;
-//             }
-            
-//             // Send DATA frame
-//             stream_send_frame(STREAM_CMD_DATA, chunk, chunk_size);
-//             sent += chunk_size;
-//             cont_stream.total_sent += chunk_size;
-//         }
-        
-//         printf("STREAM_REQ: Sent %zu bytes (total: %zu)\n", sent, cont_stream.total_sent);
-        
-//         free(chunk);  // Free the allocated chunk
-//     } else if (cont_stream.generation_complete) {
-//         // No more data and generation complete - send END
-//         stream_send_frame(STREAM_CMD_END, NULL, 0);
-//         printf("STREAM_REQ: Sent END signal\n");
-//         continuous_stream_cleanup();
-//     } else {
-//         printf("STREAM_REQ: No data available yet\n");
-//     }
-    
-//     xSemaphoreGive(cont_stream.buffer_mutex);
-// }
-
-// ===============================
-
 
 void keypad_init(void) {
     // Настройка пинов строк как выходы
@@ -880,51 +379,6 @@ void keypad_task(void *pvParameters) {
 }
 
 uint32_t send_to_stm32_cmd(command_id_t cmd_id, const char* params);
-
-void draw_circle_from_current(float diameter_mm) {
-    if (plotter.x_pos < 0 || plotter.y_pos < 0) {
-        printf("ERROR: Unknown current position; request M114/GET_POSITION first.\n");
-        return;
-    }
-
-    float current_x_mm = plotter.x_pos * MM_PER_STEP;
-    float current_y_mm = plotter.y_pos * MM_PER_STEP;
-    
-    float radius = diameter_mm / 2.0;
-    const int segments = 36;
-    char params[64];
-    
-    printf("Drawing circle D=%.1fmm from (%.2f, %.2f)\n", 
-           diameter_mm, current_x_mm, current_y_mm);
-    
-    // Поднимаем перо
-    send_to_stm32_cmd(CMD_PEN_UP, NULL);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    
-    // Движение к начальной точке круга
-    sprintf(params, "X%.2f,Y%.2f", current_x_mm + radius, current_y_mm);
-    send_to_stm32_cmd(CMD_G0_RAPID, params);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    
-    // Опускаем перо
-    send_to_stm32_cmd(CMD_PEN_DOWN, NULL);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    
-    // Рисуем круг сегментами
-    for (int i = 1; i <= segments; i++) {
-        float theta = 2.0 * M_PI * i / segments;
-        float x = current_x_mm + radius * cosf(theta);
-        float y = current_y_mm + radius * sinf(theta);
-        
-        sprintf(params, "X%.2f,Y%.2f", x, y);
-        send_to_stm32_cmd(CMD_G1_LINEAR, params);
-        vTaskDelay(pdMS_TO_TICKS(500)); // Задержка между сегментами
-    }
-    
-    // Поднимаем перо
-    send_to_stm32_cmd(CMD_PEN_UP, NULL);
-    printf("Circle completed\n");
-}
 
 void draw_concentric_circles_task(void *pvParameters);
 
@@ -998,39 +452,6 @@ static size_t build_ticks_line(float x0_mm, float y0_mm,
     }
 
     return produced_ticks; // number of ticks (nibbles), not bytes
-}
-
-static void stream_send_circle(float cx_mm, float cy_mm, float R_mm,
-                               float v_mm_s, uint32_t f_hz)
-{
-    // 1) send meta (must match STM32 Stream_Init defaults)
-    stream_meta_t meta = { .f_hz = f_hz, .step_us = 6, .guard_us = 6, .inv_mask = 0 };
-    stream_send_frame(STREAM_CMD_BEGIN, (const uint8_t*)&meta, sizeof(meta));
-
-    // 2) build polyline
-    const int segments = 144; // smoother than 36 for pen plotter
-
-    float x_prev = cx_mm + R_mm;
-    float y_prev = cy_mm;
-
-    for (int i=1; i<=segments; ++i) {
-        float th = (2.f * (float)M_PI * i) / (float)segments;
-        float x = cx_mm + R_mm * cosf(th);
-        float y = cy_mm + R_mm * sinf(th);
-
-        size_t n_ticks = build_ticks_line(x_prev, y_prev, x, y, v_mm_s, f_hz, stream_pkt, sizeof(stream_pkt));
-        size_t n_bytes = (n_ticks + 1) / 2;
-
-        // send chunk
-        if (n_bytes > 0) stream_send_frame(STREAM_CMD_DATA, stream_pkt, (uint16_t)n_bytes);
-
-        x_prev = x; y_prev = y;
-        // optional: small yield to keep WiFi/BLE alive
-        taskYIELD();
-    }
-
-    // 3) start playback
-    stream_send_frame(STREAM_CMD_START, NULL, 0);
 }
 
 // Display management
@@ -1237,7 +658,8 @@ void process_stm32_response(const char* response) {
             case CMD_PEN_UP:
             case CMD_PEN_DOWN:
             case CMD_SET_PEN:
-            case CMD_SET_COLOR: {
+            case CMD_SET_COLOR:
+            case CMD_DRAW_BEGIN: {
                 // Command acknowledged - check response
                 if (strcmp(data, "OK") == 0) {
                     printf("Command %s started\n", command_names[cmd_id]);
@@ -1274,137 +696,11 @@ static void stm32_uart_task(void *pvParameters) {
     uint8_t data;
     char buffer[256];
     uint8_t pos = 0;
-    uint8_t binary_state = 0;
-    uint8_t cmd = 0;
-    uint16_t len = 0;
-    uint8_t frame_buf[1024];  // Assuming max frame size
-    uint16_t got = 0;
-    uint16_t crc_calc = 0xFFFF;
-    uint16_t crc_recv = 0;
 
     printf("UART: Entering read loop\n");
 
     while (1) {
         if (uart_read_bytes(STM32_UART_PORT, &data, 1, pdMS_TO_TICKS(100)) == 1) {
-            //printf("UART: Read byte: 0x%02X (%c)\n", data, (data >= 32 && data < 127 ? data : '.'));
-
-            if (binary_state == 0) {
-                if (data == STREAM_SYNC0) {
-                    binary_state = 1;
-                    continue;
-                }
-            } else {
-                printf("UART: State %d, data 0x%02X\n", binary_state, data);
-                switch (binary_state) {
-                    case 1:  // SYNC1
-                        if (data == STREAM_SYNC1) {
-                            binary_state = 2;
-                        } else {
-                            binary_state = 0;
-                            // Process as text if not sync
-                            if (data >= 32 || data == '\t') {
-                                buffer[pos++] = data;
-                            }
-                        }
-                        break;
-                    case 2:  // CMD
-                        cmd = data;
-                        binary_state = 3;
-                        break;
-                    case 3:  // LEN lo
-                        len = data;
-                        binary_state = 4;
-                        break;
-                    case 4:  // LEN hi
-                        len |= (uint16_t)data << 8;
-                        crc_calc = 0xFFFF;
-                        got = 0;
-                        if (len == 0) {
-                            binary_state = 6;  // No payload, go to CRC
-                        } else {
-                            binary_state = 5;
-                        }
-                        break;
-                    case 5:  // Payload bytes
-                        if (got < len) {
-                            frame_buf[got] = data;
-                            crc_calc = crc16_ccitt(crc_calc, data);
-                            got++;
-                            if (got == len) {
-                                binary_state = 6;
-                            }
-                        }
-                        break;
-                    case 6:  // CRC hi
-                        crc_recv = (uint16_t)data << 8;
-                        binary_state = 7;
-                        break;
-                    case 7:  // CRC lo
-                        crc_recv |= data;
-                        binary_state = 8;  // Frame complete
-                        printf("UART: CRC calc=0x%04X, recv=0x%04X\n", crc_calc, crc_recv);
-                        break;
-                }
-
-                if (binary_state == 8) {
-                    if (crc_calc == crc_recv) {
-                        printf("UART: Valid frame, cmd=%d, len=%d\n", cmd, len);
-                        if (cmd == STREAM_CMD_BEGIN) {
-                            if (len == 9 || len == 10) {
-                                uint32_t f_hz = (uint32_t)frame_buf[0] | ((uint32_t)frame_buf[1]<<8) | ((uint32_t)frame_buf[2]<<16) | ((uint32_t)frame_buf[3]<<24);
-                                uint16_t step_us = frame_buf[4] | (frame_buf[5]<<8);
-                                uint16_t guard_us = frame_buf[6] | (frame_buf[7]<<8);
-                                uint8_t inv_mask = frame_buf[8];
-                                bool continuous = (len == 10 && frame_buf[9] == 0xFF);
-
-                                // Apply params
-                                // For example, set TIM4 prescaler/ARR for f_hz
-                                // Here assume we store them
-                                printf("UART: BEGIN f_hz=%lu, step=%u, guard=%u, inv=0x%02X, cont=%d\n", f_hz, step_us, guard_us, inv_mask, continuous);
-
-                                // Reset buffer
-                                cont_stream.read_pos = cont_stream.write_pos = 0;
-                                // etc.
-                            }
-                        } else if (cmd == STREAM_CMD_DATA) {
-                            // Add to buffer
-                            xSemaphoreTake(cont_stream.buffer_mutex, portMAX_DELAY);
-                            for (uint16_t i = 0; i < len; i++) {
-                                cont_stream.buffer[cont_stream.write_pos] = frame_buf[i];
-                                cont_stream.write_pos = (cont_stream.write_pos + 1) % CONTINUOUS_BUFFER_SIZE;
-                            }
-                            xSemaphoreGive(cont_stream.buffer_mutex);
-                            printf("UART: DATA received %u bytes\n", len);
-                        } else if (cmd == STREAM_CMD_START) {
-                            printf("UART: START received\n");
-                            // Start playback
-                        } else if (cmd == STREAM_CMD_ABORT) {
-                            printf("UART: ABORT received\n");
-                            // Abort
-                        } else if (cmd == STREAM_CMD_REQUEST_MORE) {
-                            if (len == 2) {
-                                uint16_t requested = frame_buf[0] | (frame_buf[1] << 8);
-                                printf("UART: Handling REQUEST_MORE for %u bytes\n", requested);
-                                handle_stream_request(requested);
-                            } else {
-                                printf("UART: Invalid len for REQUEST_MORE: %d\n", len);
-                            }
-                        } else if (cmd == STREAM_CMD_END) {
-                            printf("UART: END received\n");
-                            // Handle end
-                        } else if (cmd == STREAM_CMD_ACK) {
-                            printf("UART: ACK received\n");
-                            // Handle ACK
-                        }
-                    } else {
-                        printf("UART: CRC mismatch! calc=0x%04X, recv=0x%04X\n", crc_calc, crc_recv);
-                    }
-                    binary_state = 0;
-                    printf("UART: Reset to text mode after frame\n");
-                    continue;
-                }
-            }
-
             // Normal text processing
             if (data == '\n' || data == '\r') {
                 if (pos > 0) {
@@ -1425,265 +721,6 @@ static void stm32_uart_task(void *pvParameters) {
         taskYIELD();
     }
 }
-
-// // UART communication task
-// static void stm32_uart_task(void *pvParameters) {
-//     uint8_t data;
-//     char buffer[256];
-//     uint8_t pos = 0;
-//     uint8_t binary_state = 0;
-//     uint8_t sync[2];
-//     uint8_t cmd;
-//     uint16_t len;
-//     uint8_t frame_buf[1024];  // Assuming max frame size
-//     uint16_t crc_calc = 0xFFFF;
-//     uint16_t crc_recv;
-
-//     printf("UART: Entering read loop\n");  // NEW: Log entry
-
-//     while (1) {
-//         if (uart_read_bytes(STM32_UART_PORT, &data, 1, pdMS_TO_TICKS(100)) == 1) {
-//             printf("UART: Read byte: 0x%02X (%c)\n", data, (data >= 32 && data < 127 ? data : '.'));  // NEW: Log every incoming byte
-
-//             if (binary_state == 0) {
-//                 if (data == STREAM_SYNC0) {
-//                     binary_state = 1;
-//                     continue;
-//                 }
-//             } else {
-//                 printf("UART: State %d, data 0x%02X\n", binary_state, data);  // NEW: Log state transitions
-//                 switch (binary_state) {
-//                     case 1:  // SYNC1
-//                         if (data == STREAM_SYNC1) {
-//                             binary_state = 2;
-//                         } else {
-//                             binary_state = 0;
-//                             // Process as text if not sync
-//                             if (data >= 32 || data == '\t') {
-//                                 buffer[pos++] = data;
-//                             }
-//                         }
-//                         break;
-//                     case 2:  // CMD
-//                         cmd = data;
-//                         binary_state = 3;
-//                         break;
-//                     case 3:  // LEN lo
-//                         len = data;
-//                         binary_state = 4;
-//                         break;
-//                     case 4:  // LEN hi
-//                         len |= (uint16_t)data << 8;
-//                         crc_calc = 0xFFFF;
-//                         if (len == 0) {
-//                             binary_state = 6;  // No payload, go to CRC
-//                         } else {
-//                             binary_state = 5;
-//                         }
-//                         break;
-//                     case 5:  // Payload bytes
-//                         if (got < len) {
-//                             frame_buf[got] = data;
-//                             crc_calc = crc16_ccitt(crc_calc, data);
-//                             got++;
-//                             if (got == len) {
-//                                 binary_state = 6;
-//                             }
-//                         }
-//                         break;
-//                     case 6:  // CRC hi
-//                         crc_recv = (uint16_t)data << 8;
-//                         binary_state = 7;
-//                         break;
-//                     case 7:  // CRC lo
-//                         crc_recv |= data;
-//                         binary_state = 8;  // Frame complete
-//                         printf("UART: CRC calc=0x%04X, recv=0x%04X\n", crc_calc, crc_recv);  // NEW: Log CRC check
-//                         break;
-//                 }
-
-//                 if (binary_state == 8) {
-//                     if (crc_calc == crc_recv) {
-//                         printf("UART: Valid frame, cmd=%d, len=%d\n", cmd, len);  // NEW: Log successful frame
-//                         if (cmd == STREAM_CMD_BEGIN) {
-//                             // (code elided)
-//                         } else if (cmd == STREAM_CMD_DATA) {
-//                             // (code elided)
-//                         } else if (cmd == STREAM_CMD_START) {
-//                             // (code elided)
-//                         } else if (cmd == STREAM_CMD_ABORT) {
-//                             // (code elided)
-//                         } else if (cmd == STREAM_CMD_REQUEST_MORE) {
-//                             if (len == 2) {
-//                                 uint16_t requested = frame_buf[0] | (frame_buf[1] << 8);
-//                                 printf("UART: Handling REQUEST_MORE for %u bytes\n", requested);  // NEW: Log request handling
-//                                 handle_stream_request(requested);
-//                             } else {
-//                                 printf("UART: Invalid len for REQUEST_MORE: %d\n", len);  // NEW: Error log
-//                             }
-//                         } else if (cmd == STREAM_CMD_END) {
-//                             // ... (existing code if any)
-//                         } else if (cmd == STREAM_CMD_ACK) {
-//                             // ... (existing code if any)
-//                         }
-//                     } else {
-//                         printf("UART: CRC mismatch! calc=0x%04X, recv=0x%04X\n", crc_calc, crc_recv);  // NEW: Log CRC error
-//                     }
-//                     binary_state = 0;
-//                     printf("UART: Reset to text mode after frame\n");  // NEW: Log reset
-//                     continue;
-//                 }
-//             }
-
-//             // Normal text processing
-//             if (data == '\n' || data == '\r') {
-//                 if (pos > 0) {
-//                     buffer[pos] = '\0';
-//                     process_stm32_response(buffer);
-//                     pos = 0;
-//                 }
-//             } else if (pos < sizeof(buffer) - 1) {
-//                 if (data >= 32 || data == '\t') {
-//                     buffer[pos++] = data;
-//                 }
-//             } else {
-//                 pos = 0;
-//             }
-//         }
-        
-//         taskYIELD();
-//     }
-// }
-
-// void stm32_uart_task(void *pvParameters) {
-//     char buffer[512];
-//     int pos = 0;
-//     uint8_t binary_state = 0;
-    
-//     printf("STM32 UART task started (with stream request support)\n");
-//     uart_flush(STM32_UART_PORT);
-    
-//     while (1) {
-//         uint8_t data;
-//         int len = uart_read_bytes(STM32_UART_PORT, &data, 1, pdMS_TO_TICKS(10));
-        
-//         if (len > 0) {
-//             // Check for binary stream request
-//             if (data == STREAM_SYNC0 && binary_state == 0) {
-//                 binary_state = 1;
-//                 continue;
-//             } else if (binary_state == 1) {
-//                 if (data == STREAM_SYNC1) {
-//                     // Read command byte
-//                     uint8_t cmd;
-//                     uart_read_bytes(STM32_UART_PORT, &cmd, 1, pdMS_TO_TICKS(100));
-                    
-//                     if (cmd == STREAM_CMD_REQUEST_MORE) {
-//                         // Read payload length (2 bytes)
-//                         uint8_t len_bytes[2];
-//                         uart_read_bytes(STM32_UART_PORT, len_bytes, 2, pdMS_TO_TICKS(100));
-//                         uint16_t payload_len = len_bytes[0] | (len_bytes[1] << 8);
-                        
-//                         // Read requested size
-//                         if (payload_len == 2) {
-//                             uint8_t size_bytes[2];
-//                             uart_read_bytes(STM32_UART_PORT, size_bytes, 2, pdMS_TO_TICKS(100));
-//                             uint16_t requested = size_bytes[0] | (size_bytes[1] << 8);
-                            
-//                             // Handle request
-//                             handle_stream_request(requested);
-//                         }
-//                     }
-//                     binary_state = 0;
-//                     continue;
-//                 } else {
-//                     binary_state = 0;
-//                     // Process the SYNC0 and current byte as normal text
-//                 }
-//             }
-            
-//             // Normal text processing
-//             if (data == '\n' || data == '\r') {
-//                 if (pos > 0) {
-//                     buffer[pos] = '\0';
-//                     process_stm32_response(buffer);
-//                     pos = 0;
-//                 }
-//             } else if (pos < sizeof(buffer) - 1) {
-//                 if (data >= 32 || data == '\t') {
-//                     buffer[pos++] = data;
-//                 }
-//             } else {
-//                 pos = 0;
-//             }
-//         }
-        
-//         taskYIELD();
-//     }
-// }
-
-void start_continuous_spiral(void) {
-    printf("Starting continuous spiral streaming\n");
-    
-    // Ensure we're homed first
-    if (!plotter.is_homed) {
-        printf("ERROR: Not homed, please home first\n");
-        return;  // NEW: Abort early
-    }
-    
-    // Get limits if needed
-    if (plotter.x_max == 0.0f || plotter.y_max == 0.0f) {
-        send_to_stm32_cmd(CMD_GET_LIMITS, NULL);
-        vTaskDelay(pdMS_TO_TICKS(2000));  // Increased from 1000ms for response time
-    }
-    
-    // NEW: Check if limits were successfully obtained
-    if (plotter.x_max <= 0.0f || plotter.y_max <= 0.0f) {
-        printf("ERROR: Invalid limits (X=%.2f, Y=%.2f) - cannot start spiral\n",
-               plotter.x_max, plotter.y_max);
-        return;  // Abort to prevent zero-byte generation and crash
-    }
-    
-    // Initialize
-    continuous_stream_init();
-    
-    // Send BEGIN with continuous flag
-    uint8_t begin_payload[10];
-    uint32_t f_hz = STREAM_F_HZ;
-    begin_payload[0] = (uint8_t)(f_hz & 0xFF);
-    begin_payload[1] = (uint8_t)((f_hz >> 8) & 0xFF);
-    begin_payload[2] = (uint8_t)((f_hz >> 16) & 0xFF);
-    begin_payload[3] = (uint8_t)((f_hz >> 24) & 0xFF);
-    begin_payload[4] = (uint8_t)(STREAM_STEP_US & 0xFF);
-    begin_payload[5] = (uint8_t)(STREAM_STEP_US >> 8);
-    begin_payload[6] = (uint8_t)(STREAM_GUARD_US & 0xFF);
-    begin_payload[7] = (uint8_t)(STREAM_GUARD_US >> 8);
-    begin_payload[8] = STREAM_INV_MASK;
-    begin_payload[9] = 0xFF;  // Magic byte for continuous mode
-    
-    stream_send_frame(STREAM_CMD_BEGIN, begin_payload, 10);
-    
-    // Start generator task
-    xTaskCreate(continuous_spiral_generator, "spiral_gen", 4096, NULL, 5, &cont_stream.generator_task);
-    
-    // Wait a bit for initial data generation
-    vTaskDelay(pdMS_TO_TICKS(100));
-    
-    // Send initial chunk
-    handle_stream_request(CONTINUOUS_CHUNK_SIZE);
-    
-    // Send START command
-    stream_send_frame(STREAM_CMD_START, NULL, 0);
-    
-    // Важно: даем время на обработку бинарного кадра
-    vTaskDelay(pdMS_TO_TICKS(50));
-    
-    // Очищаем UART буфер от возможного мусора
-    uart_flush(STM32_UART_PORT);
-    
-    printf("Continuous streaming started\n");
-}
-
 // ================================ STREAMING FNCs END =============================
 
 void plotter_control_task(void *pvParameters) {
@@ -1833,179 +870,130 @@ static bool wait_command_completion(uint32_t request_id, const char* step_name, 
     return false;
 }
 
-void draw_concentric_circles_task(void *pvParameters) {
-    const float margin_mm = 2.0f;
-    const int   segments  = 36;
-    char buf[64];
-    uint32_t request_id;
+static inline bool is_stm32_ready(void) {
+    return gpio_get_level(STM32_READY_PIN) == 1;
+}
 
-    printf("CIRCLES: Task started, waiting for system ready...\n");
+// ============ Send nibbles via SPI ============
 
-    // Получаем лимиты
-    printf("CIRCLES: System ready, requesting limits...\n");
-    send_to_stm32_cmd(CMD_GET_LIMITS, NULL);
+static void spi_send_nibbles(const uint8_t *data, size_t len) {
+    if (!stm32_spi || !data || len == 0) return;
     
-    // Ждем лимиты (только это критично)
-    uint32_t limits_timeout = xTaskGetTickCount();
-    while ((plotter.x_max == 0.0f || plotter.y_max == 0.0f) && 
-           (xTaskGetTickCount() - limits_timeout) < pdMS_TO_TICKS(5000)) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-
-    if (plotter.x_max == 0.0f || plotter.y_max == 0.0f) {
-        printf("CIRCLES: ERROR - Failed to get limits!\n");
-        send_to_stm32_cmd(CMD_GET_LIMITS, NULL);
-        vTaskDelay(pdMS_TO_TICKS(500));  // Сократили с 1000
-        
-        if (plotter.x_max == 0.0f || plotter.y_max == 0.0f) {
-            printf("CIRCLES: ERROR - Still no limits, aborting!\n");
-            vTaskDelete(NULL);
-            return;
-        }
+    // Wait for READY signal
+    int wait_count = 0;
+    while (!is_stm32_ready() && wait_count < 100) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        wait_count++;
     }
     
-    printf("CIRCLES: Limits: X=%.2f, Y=%.2f\n", plotter.x_max, plotter.y_max);
+    if (!is_stm32_ready()) {
+        printf("SPI: STM32 not ready, skipping transfer\n");
+        return;
+    }
     
-    float x_max_mm = plotter.x_max;
-    float y_max_mm = plotter.y_max;
-    float shorter  = (x_max_mm < y_max_mm) ? x_max_mm : y_max_mm;
-    float base_D   = shorter - 2 * margin_mm;
-    float cx       = x_max_mm / 2.0f;
-    float cy       = y_max_mm / 2.0f;
-    printf("CIRCLES: Center=(%.2f,%.2f), base_D=%.2f\n", cx, cy, base_D);
+    // Send data in chunks
+    size_t sent = 0;
+    while (sent < len) {
+        size_t chunk_size = (len - sent > SPI_CHUNK_SIZE) ? SPI_CHUNK_SIZE : (len - sent);
+        
+        spi_transaction_t trans = {
+            .length = chunk_size * 8,  // In bits
+            .tx_buffer = &data[sent],
+            .rx_buffer = NULL
+        };
+        
+        esp_err_t ret = spi_device_transmit(stm32_spi, &trans);
+        if (ret != ESP_OK) {
+            printf("SPI transmit failed: %s\n", esp_err_to_name(ret));
+            break;
+        }
+        
+        sent += chunk_size;
+        
+        // Small delay between chunks
+        if (sent < len) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+    }
+}
 
-    send_to_stm32_cmd(CMD_G90_ABSOLUTE, NULL);
+// ============ Continuous SPI sender task ============
+
+static void spi_continuous_sender_task(void *pvParams) {
+    printf("SPI sender task started\n");
     
-    // Рисуем 4 концентрических круга
-    for (int color = 1; color <= 4; color++) {
-        printf("\nCIRCLES: === Color %d ===\n", color);
-
-        float D = base_D * (1.0f - 0.2f * (float)(color - 1));
-        float R = D / 2.0f;
-        
-        if (R <= 0) {
-            printf("CIRCLES: Radius too small, skipping color %d\n", color);
-            continue;
-        }
-        
-        printf("CIRCLES: Diameter=%.2f, Radius=%.2f\n", D, R);
+    while (spi_stream.active) {
+        // Check if STM32 wants data
+        if (is_stm32_ready()) {
+            // Get data from generator buffer (similar to cont_stream logic)
+            uint8_t chunk[SPI_CHUNK_SIZE];
+            size_t available = 0;
             
-        // Шаг 1: Поднять перо
-        printf("CIRCLES: Step 1 - Lifting pen\n");
-        request_id = send_to_stm32_cmd(CMD_PEN_UP, NULL);
-        if (!wait_command_completion(request_id, "PEN_UP", 10000)) {
-            printf("CIRCLES: Pen up failed, continuing anyway\n");
-        }
-        // УБРАЛИ vTaskDelay - сразу идем дальше
-
-        // Шаг 2: Движение к центру
-        printf("CIRCLES: Step 2 - Moving to center (%.2f, %.2f)\n", cx, cy);
-        sprintf(buf, "X%.2f,Y%.2f", cx, cy);
-        request_id = send_to_stm32_cmd(CMD_G0_RAPID, buf);
-        if (!wait_command_completion(request_id, "Move to center", 15000)) {
-            printf("CIRCLES: Move to center failed, skipping color %d\n", color);
-            continue;
-        }
-        // УБРАЛИ vTaskDelay
-
-        // Шаг 3: УБРАЛИ паузу в центре - не нужна
-
-        // Шаг 4: Смена цвета
-        printf("CIRCLES: Step 4 - Setting color %d\n", color);
-        sprintf(buf, "C%hhu", (uint8_t)(color - 1));
-        request_id = send_to_stm32_cmd(CMD_SET_COLOR, buf);
-        if (!wait_command_completion(request_id, "Color change", 30000)) {
-            printf("CIRCLES: Color change failed, continuing with current color\n");
-        }
-        // УБРАЛИ vTaskDelay
-
-        // Шаг 5: Движение к стартовой точке окружности
-        float start_x = cx + R;
-        float start_y = cy;
-        printf("CIRCLES: Step 5 - Moving to start point (%.2f, %.2f)\n", start_x, start_y);
-        sprintf(buf, "X%.2f,Y%.2f", start_x, start_y);
-        request_id = send_to_stm32_cmd(CMD_G0_RAPID, buf);
-        if (!wait_command_completion(request_id, "Move to start", 15000)) {
-            printf("CIRCLES: Move to start failed, skipping color %d\n", color);
-            continue;
-        }
-        // УБРАЛИ vTaskDelay
-
-        // Шаг 6: Опустить перо
-        printf("CIRCLES: Step 6 - Lowering pen\n");
-        request_id = send_to_stm32_cmd(CMD_PEN_DOWN, NULL);
-        if (!wait_command_completion(request_id, "PEN_DOWN", 10000)) {
-            printf("CIRCLES: Pen down failed, drawing without pen contact\n");
-        }
-        vTaskDelay(pdMS_TO_TICKS(200));  // Оставляем МИНИМАЛЬНУЮ задержку только после опускания пера
-
-        // Шаг 7: Рисование окружности сегментами БЕЗ ЗАДЕРЖЕК
-        printf("CIRCLES: Step 7 - Drawing circle (%d segments)\n", segments);
-        bool circle_completed = true;
-        
-        for (int i = 1; i <= segments; i++) {
-            float theta = 2.0f * M_PI * i / segments;
-            float x_point = cx + R * cosf(theta);
-            float y_point = cy + R * sinf(theta);
-            
-            sprintf(buf, "X%.2f,Y%.2f", x_point, y_point);
-            request_id = send_to_stm32_cmd(CMD_G1_LINEAR, buf);
-            
-            // Используем более короткий таймаут для сегментов
-            char segment_name[32];
-            sprintf(segment_name, "Segment %d", i);
-            if (!wait_command_completion(request_id, segment_name, 5000)) {  // Сократили с 8000
-                printf("CIRCLES: Segment %d failed, stopping circle\n", i);
-                circle_completed = false;
-                break;
+            // TODO: Get data from your generator buffer
+            // For now, just send test pattern
+            for (int i = 0; i < SPI_CHUNK_SIZE/2; i++) {
+                // Simple test: alternating X and Y steps
+                chunk[i*2] = 0x05;     // X step + dir
+                chunk[i*2+1] = 0x0A;   // Y step + dir
             }
+            available = SPI_CHUNK_SIZE;
             
-            // Прогресс выводим реже
-            if (i % 9 == 0) {  // Изменили с 6 на 9
-                printf("CIRCLES: Progress %d/%d segments\n", i, segments);
+            if (available > 0) {
+                spi_send_nibbles(chunk, available);
             }
         }
-
-        // Шаг 8: Поднять перо после завершения круга
-        printf("CIRCLES: Step 8 - Lifting pen after circle\n");
-        request_id = send_to_stm32_cmd(CMD_PEN_UP, NULL);
-        wait_command_completion(request_id, "Final PEN_UP", 5000);
-
-        printf("CIRCLES: Color %d %s\n", color, circle_completed ? "completed successfully" : "failed");
         
-        // УБРАЛИ финальную задержку между кругами
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
-
-    printf("CIRCLES: All circles finished! Returning to center\n");
     
-    // Финальное позиционирование в центр
-    sprintf(buf, "X%.2f,Y%.2f", cx, cy);
-    send_to_stm32_cmd(CMD_G0_RAPID, buf);
-    
-    vTaskDelay(pdMS_TO_TICKS(500));  // Сократили с 2000
-    
-    printf("CIRCLES: Task completed, deleting task\n");
+    printf("SPI sender task ended\n");
     vTaskDelete(NULL);
 }
 
-void test_simple_move(void) {
-    printf("\n=== TEST: Simple manual movement ===\n");
+// ============ Start SPI streaming ============
+
+static void start_spi_stream(void) {
+    if (spi_stream.active) {
+        printf("SPI stream already active\n");
+        return;
+    }
     
-    // Отправляем простые текстовые команды для проверки
-    send_to_stm32_cmd(CMD_HOME, NULL);
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    // Send CMD_DRAW_BEGIN to STM32
+    uint32_t req_id = send_to_stm32_cmd(CMD_DRAW_BEGIN, NULL);
     
-    send_to_stm32_cmd(CMD_PEN_UP, NULL);
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    // Wait for acknowledgment
+    vTaskDelay(pdMS_TO_TICKS(100));
     
-    // Простое движение
-    send_to_stm32_cmd(CMD_G0_RAPID, "X10.0,Y10.0");
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    // Start streaming
+    spi_stream.active = 1;
     
-    send_to_stm32_cmd(CMD_G0_RAPID, "X20.0,Y20.0");
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    // Create sender task
+    xTaskCreate(spi_continuous_sender_task, "spi_sender", 4096, NULL, 5, &spi_stream.sender_task);
     
-    printf("TEST: Complete\n");
+    printf("SPI streaming started\n");
+}
+
+// ============ Stop SPI streaming ============
+
+static void stop_spi_stream(void) {
+    if (!spi_stream.active) {
+        printf("SPI stream not active\n");
+        return;
+    }
+    
+    // Send CMD_DRAW_FINISH_WHEN_EMPTY to STM32
+    send_to_stm32_cmd(CMD_DRAW_FINISH_WHEN_EMPTY, NULL);
+    
+    // Stop streaming
+    spi_stream.active = 0;
+    
+    // Wait for task to finish
+    if (spi_stream.sender_task) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        spi_stream.sender_task = NULL;
+    }
+    
+    printf("SPI streaming stopped\n");
 }
 
 void process_keypad_command(char key) {
@@ -2024,157 +1012,86 @@ void process_keypad_command(char key) {
             send_to_stm32_cmd(CMD_HOME, NULL);
             break;
             
-        case '3':
-            printf("KEYPAD: Pen UP\n");
-            send_to_stm32_cmd(CMD_PEN_UP, NULL);
+        case '3':  // Start SPI streaming test
+            printf("KEYPAD: Starting SPI stream test\n");
+            start_spi_stream();
             break;
-            
-        case '4':
-            printf("KEYPAD: Pen DOWN\n");
-            send_to_stm32_cmd(CMD_PEN_DOWN, NULL);
+
+        case '4':  // Stop SPI streaming
+            printf("KEYPAD: Stopping SPI stream\n");
+            stop_spi_stream();
             break;
             
         case '5':
-            printf("KEYPAD: Select color 0\n");
-            send_to_stm32_cmd(CMD_SET_COLOR, "C0");
-            break;
-            
-        case '6':
-            printf("KEYPAD: Select color 1\n");
-            send_to_stm32_cmd(CMD_SET_COLOR, "C1");
-            break;
-            
-        case '7':
-            printf("KEYPAD: Select color 2\n");
-            send_to_stm32_cmd(CMD_SET_COLOR, "C2");
-            break;
-            
-        case '8':
-            printf("KEYPAD: Select color 3\n");
-            send_to_stm32_cmd(CMD_SET_COLOR, "C3");
+            printf("KEYPAD: Drawing circle via SPI\n");
+            if (plotter.x_max > 0 && plotter.y_max > 0) {
+                float cx = plotter.x_max / 2.0f;
+                float cy = plotter.y_max / 2.0f;
+                float radius = fminf(plotter.x_max, plotter.y_max) / 4.0f;
+                draw_circle_spi(cx, cy, radius, 20.0f);
+            }
             break;
             
         case '9':
-            printf("KEYPAD: Draw 10mm circle from current position\n");
-            draw_circle_from_current(10.0); // Функция ниже
-            break;
-            
-        case '0':
-        {
-            // Example: concentric circles by streaming ticks
-            // Make sure STM32 stream parser is ready before using this
-            const float margin_mm = 2.0f;
-            const float x_max = plotter.x_max;
-            const float y_max = plotter.y_max;
-            if (x_max <= 0 || y_max <= 0) {
-                send_to_stm32_cmd(CMD_GET_LIMITS, NULL);
-                printf("STREAM: no limits yet\n");
-                break;
-            }
-
-            float shorter = (x_max < y_max) ? x_max : y_max;
-            float base_D  = shorter - 2*margin_mm;
-            float cx = x_max * 0.5f, cy = y_max * 0.5f;
-
-            // pen-up, move to start of outer circle (text protocol still)
-            send_to_stm32_cmd(CMD_PEN_UP, NULL);
-            char p[64];
-            sprintf(p, "X%.2f,Y%.2f", cx + base_D*0.5f, cy);
-            send_to_stm32_cmd(CMD_G0_RAPID, p);
-
-            // Now stream 4 circles with D, 0.8D, 0.6D, 0.4D
-            const uint32_t f_hz = 10000;
-            const float v_mm_s  = 20.0f; // ~1200 mm/min
-
-            for (int i=0;i<4;i++) {
-                float D = base_D * (1.0f - 0.2f * i);
-                float R = 0.5f * D;
-
-                // set color via text protocol
-                char cbuf[8];
-                sprintf(cbuf, "C%u", (unsigned)i);
-                send_to_stm32_cmd(CMD_SET_COLOR, cbuf);
-                // lower pen
-                send_to_stm32_cmd(CMD_PEN_DOWN, NULL);
-
-                // stream circle
-                stream_send_circle(cx, cy, R, v_mm_s, f_hz);
-
-                // lift pen after playback (можно по завершению, когда добавим ACK)
-                send_to_stm32_cmd(CMD_PEN_UP, NULL);
-            }
-            break;
-        }
-
-        case 'A':  // Start continuous spiral
-        {
-            printf("KEYPAD: Starting continuous spiral stream\n");
-            
-            // Ensure we're homed first
-            if (!plotter.is_homed) {
-                printf("ERROR: Not homed, please home first\n");
-                break;
-            }
-            
-            // NEW: Fetch and validate limits here too (redundant with start_continuous_spiral, but ensures safety)
-            if (plotter.x_max == 0.0f || plotter.y_max == 0.0f) {
-                send_to_stm32_cmd(CMD_GET_LIMITS, NULL);
-                vTaskDelay(pdMS_TO_TICKS(2000));
-            }
-            if (plotter.x_max <= 0.0f || plotter.y_max <= 0.0f) {
-                printf("ERROR: Invalid limits - cannot start spiral\n");
-                break;
-            }
-            
-            // Start continuous streaming
-            start_continuous_spiral();
-            break;
-        }        
-
-        case 'B':  // Stop continuous streaming
-        {
-            printf("KEYPAD: Stopping continuous stream\n");
-            
-            // Send END signal
-            stream_send_frame(STREAM_CMD_END, NULL, 0);
-            
-            // Clean up
-            continuous_stream_cleanup();
-            
-            // Send ABORT just to be safe
-            stream_send_frame(STREAM_CMD_ABORT, NULL, 0);
-            
-            printf("Continuous streaming stopped\n");
-            break;
-        }
-                    
-        case 'C':
-            printf("KEYPAD: Move to (20,20)\n");
-            sprintf(params, "X20.00,Y20.00");
-            send_to_stm32_cmd(CMD_G0_RAPID, params);
-            break;
-            
-        case 'D':
-            printf("KEYPAD: Move to (10,20)\n");
-            sprintf(params, "X10.00,Y20.00");
-            send_to_stm32_cmd(CMD_G0_RAPID, params);
-            break;
-            
-        case '*':
             printf("KEYPAD: Emergency STOP!\n");
             send_to_stm32_cmd(CMD_EMERGENCY_STOP, NULL);
-            break;
-            
-        case '#':
-            printf("KEYPAD: Get status\n");
-            send_to_stm32_cmd(CMD_GET_STATUS, NULL);
-            send_to_stm32_cmd(CMD_GET_POSITION, NULL);
             break;
             
         default:
             printf("KEYPAD: Unknown key\n");
             break;
     }
+}
+
+// ============ SPI Initialization ============
+
+static void stm32_spi_init(void) {
+    // Configure READY pin as input
+    gpio_config_t ready_conf = {
+        .pin_bit_mask = (1ULL << STM32_READY_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLDOWN_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&ready_conf);
+    
+    // Initialize SPI bus (if not already done)
+    spi_bus_config_t buscfg = {
+        .mosi_io_num = STM32_SPI_MOSI,
+        .miso_io_num = STM32_SPI_MISO,
+        .sclk_io_num = STM32_SPI_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = SPI_CHUNK_SIZE
+    };
+    
+    esp_err_t ret = spi_bus_initialize(STM32_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK) {
+        printf("SPI bus init failed: %s\n", esp_err_to_name(ret));
+        return;
+    }
+    
+    // Add STM32 as SPI device
+    spi_device_interface_config_t devcfg = {
+        .command_bits = 0,
+        .address_bits = 0,
+        .mode = 0,                      // SPI mode 0 (CPOL=0, CPHA=0)
+        .clock_speed_hz = 2*1000*1000,  // 2 MHz
+        .spics_io_num = STM32_SPI_CS,
+        .queue_size = 1,
+        .flags = 0,
+        .pre_cb = NULL,
+        .post_cb = NULL
+    };
+    
+    ret = spi_bus_add_device(STM32_SPI_HOST, &devcfg, &stm32_spi);
+    if (ret != ESP_OK) {
+        printf("Failed to add SPI device: %s\n", esp_err_to_name(ret));
+        return;
+    }
+    
+    printf("SPI initialized for STM32 communication\n");
 }
 
 void app_main() {
