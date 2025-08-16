@@ -1,3 +1,4 @@
+#include "esp32_to_stm32.h"
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -5,6 +6,7 @@
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
+#include "../main/shared/cmd_ids.h"
 //#include "u8g2.h"
 #include <math.h>
 
@@ -122,8 +124,8 @@ static const char keypad_keys[KEYPAD_ROWS][KEYPAD_COLS] = {
 };
 
 typedef struct {
-    char last_key = 0;
-    uint32_t last_key_time = 0;
+    char last_key;
+    uint32_t last_key_time;
 } keypad_state_t;
 
 typedef struct {
@@ -138,6 +140,7 @@ typedef struct {
     TickType_t last_status_request;
     TickType_t last_rx_any;
     TickType_t last_rx_heartbeat;
+    TickType_t last_ready_request;
 
     uint8_t heartbeat_ok;
     char status_text[64];
@@ -147,7 +150,7 @@ typedef struct {
     volatile uint32_t request_counter;
 } plotter_manager_t;
 
-static plotter_state_t plotter = {
+static plotter_manager_t plotter = {
     .state.is_connected = 0,
     .state.is_calibrated = 0,
     .state.is_homed = 0,
@@ -189,13 +192,13 @@ uint32_t send_to_stm32_cmd(command_id_t cmd_id, const char* params) {
     }
     
     if (params && strlen(params) > 0) {
-        snprintf(full_msg, sizeof(full_msg), "%lu:%d:%s\n", request_counter, cmd_id, params);
+        snprintf(full_msg, sizeof(full_msg), "%lu:%d:%s\n", plotter.request_counter, cmd_id, params);
     } else {
-        snprintf(full_msg, sizeof(full_msg), "%lu:%d\n", request_counter, cmd_id);
+        snprintf(full_msg, sizeof(full_msg), "%lu:%d\n", plotter.request_counter, cmd_id);
     }
     if (cmd_id < CMD_DUMMY_ACTIVE_COMMANDS_DELIMITER)
     {
-        plotter.current_cmd_status.request_id = request_counter;
+        plotter.current_cmd_status.request_id = plotter.request_counter;
         plotter.current_cmd_status.cmd_state = CMD_NOT_PRESENTED;
     }
     
@@ -210,34 +213,14 @@ uint32_t send_to_stm32_cmd(command_id_t cmd_id, const char* params) {
                  command_names[cmd_id]);
     }
 
-    return request_counter++;
+    return plotter.request_counter++;
 }
 
 uint8_t is_stm32_ready(void) {
     return gpio_get_level(STM32_READY_PIN) == 1;
 }
 
-void draw_start_received_callback()
-{
-    uint32_t req_id = send_to_stm32_cmd(CMD_DRAW_BEGIN, NULL);
-}
-
-void send_data_when_ready()
-{
-        printf("ERROR: STM32 not ready for streaming\n");
-        return;
-    }
-
-        vTaskDelay(pdMS_TO_TICKS(500));
-        send_to_stm32_cmd(CMD_DRAW_FINISH_WHEN_EMPTY, NULL);        
-    }
-    else
-    {
-        printf("WARNING: No nibbles generated for test line\n");
-    }
-}
-
-void spi_send_nibbles(const uint8_t *data, uint32_t len)
+void spi_send_nibbles(const uint8_t *data, size_t len)
 {
     printf("\n=== SPI SEND NIBBLES ===\n");
     printf("Sending %zu bytes via SPI\n", len);
@@ -314,27 +297,6 @@ void spi_send_nibbles(const uint8_t *data, uint32_t len)
     }
 
     printf("SPI transfer complete: sent %zu/%zu bytes\n", sent, len);
-}
-
-static void stm32_draw_stream_proxy_task()
-{
-    printf("Plotter draw stream proxy task started\n");
-
-    while (1) {
-        TickType_t now = xTaskGetTickCount();
-
-        if (!is_stm32_ready()) {
-        if ((now - plotter.last_ready_request) < pdMS_TO_TICKS(10)) {
-            continue;
-        }
-        
-
-        size_t bytes_to_send = SPI_CHUNK_SIZE;
-        memset(&line_nibbles_buffer[nibbles_count/2], 0, bytes_to_send - nibbles_count/2);
-        spi_send_nibbles(line_nibbles_buffer, bytes_to_send);
-
-        vTaskDelay(pdMS_TO_TICKS(6));
-    }
 }
 
 // =========================== KEYPAD =============================
@@ -432,13 +394,13 @@ void process_stm32_response(const char* response) {
                 
                 printf("Processing CMD_GET_STATUS, data: %s\n", data);
                 if (strlen(data) >= 4) {
-                    plotter.is_calibrated = (data[0] == '1');
-                    plotter.is_homed = (data[1] == '1');
-                    plotter.is_processing_cmd = (data[2] == '1');
-                    plotter.is_idle = (data[3] == '1');
+                    plotter.state.is_calibrated = (data[0] == '1');
+                    plotter.state.is_homed = (data[1] == '1');
+                    plotter.state.is_processing_cmd = (data[2] == '1');
+                    plotter.state.is_idle = (data[3] == '1');
                     printf("Status updated: cal=%d, home=%d, proc=%d, idle=%d\n",
-                           plotter.is_calibrated, plotter.is_homed,
-                           plotter.is_processing_cmd, plotter.is_idle);
+                           plotter.state.is_calibrated, plotter.state.is_homed,
+                           plotter.state.is_processing_cmd, plotter.state.is_idle);
                 }
                 break;
                 
@@ -471,13 +433,13 @@ void process_stm32_response(const char* response) {
             
             case CMD_GET_POSITION:
             if (strstr(data, "?")) {
-                plotter.x_pos = -1;
-                plotter.y_pos = -1;
+                plotter.state.x_pos = -1;
+                plotter.state.y_pos = -1;
             } else {
                 int32_t x_steps, y_steps;
                 sscanf(data, "X%ld:Y%ld", &x_steps, &y_steps);
-                plotter.x_pos = x_steps;
-                plotter.y_pos = y_steps;
+                plotter.state.x_pos = x_steps;
+                plotter.state.y_pos = y_steps;
             }
             break;
             
@@ -485,8 +447,8 @@ void process_stm32_response(const char* response) {
                 {
                     float x_mm, y_mm;
                     if (sscanf(data, "X%f,Y%f", &x_mm, &y_mm) == 2) {
-                        plotter.x_max = x_mm;
-                        plotter.y_max = y_mm;
+                        plotter.state.x_max = x_mm;
+                        plotter.state.y_max = y_mm;
                         printf("Limits received: X=%.2f mm, Y=%.2f mm\n", x_mm, y_mm);
                     } else {
                         printf("Failed to parse limits from: %s\n", data);
@@ -497,13 +459,13 @@ void process_stm32_response(const char* response) {
             case CMD_GET_DIAGNOSTICS: {
                 int pen_state;
                 sscanf(data, "PEN:%d,FEED:%hu,SF:%f", 
-                    &pen_state, &plotter.feedrate, &plotter.speed_factor);
-                plotter.pen_is_down = (pen_state == 1);
+                    &pen_state, &plotter.state.feedrate, &plotter.state.speed_factor);
+                plotter.state.pen_is_down = (pen_state == 1);
                 break;
             }
                 
             case CMD_GET_COLOR:
-                sscanf(data, "C%hhu:%15s", &plotter.current_color, plotter.color_name);
+                sscanf(data, "C%hhu:%15s", &plotter.state.current_color, plotter.state.color_name);
                 break;
                 
             case CMD_CALIBRATE:
@@ -550,7 +512,7 @@ void process_stm32_response(const char* response) {
     }
     else {
     }
-    plotter.is_connected = true;
+    plotter.state.is_connected = true;
 }
 
 void stm32_uart_task(void *pvParameters) {
@@ -618,13 +580,13 @@ void plotter_control_task(void *pvParameters) {
                                 ? plotter.last_rx_heartbeat
                                 : plotter.last_rx_any;
 
-        bool prev_connected = plotter.is_connected;
-        plotter.is_connected = (last_alive != 0) &&
+        bool prev_connected = plotter.state.is_connected;
+        plotter.state.is_connected = (last_alive != 0) &&
                             ((now - last_alive) <= pdMS_TO_TICKS(CONNECT_TIMEOUT_MS));
 
         // (опционально) логируем только смену состояния
-        if (prev_connected != plotter.is_connected) {
-            printf("[link] is_connected = %s\n", plotter.is_connected ? "true" : "false");
+        if (prev_connected != plotter.state.is_connected) {
+            printf("[link] is_connected = %s\n", plotter.state.is_connected ? "true" : "false");
         }
 
         vTaskDelay(pdMS_TO_TICKS(50));    
@@ -647,38 +609,6 @@ void process_keypad_command(char key) {
         case '2':
             printf("KEYPAD: Starting homing\n");
             send_to_stm32_cmd(CMD_HOME, NULL);
-            break;
-            
-        case '3':  // УПРОЩЕННЫЙ тест SPI без пера
-            plotter.x_max = 15;
-            plotter.y_max = 15;
-            printf("KEYPAD: Testing SPI circle draw (no pen)\n");
-            if (plotter.is_calibrated && plotter.is_homed) {
-                // Сразу рисовать круг БЕЗ команд пера
-                if (plotter.x_max > 0 && plotter.y_max > 0) {
-                    float cx = plotter.x_max / 2.0f;
-                    float cy = plotter.y_max / 2.0f;
-                    float radius = fminf(plotter.x_max, 
-                                       plotter.y_max) / 6.0f;
-                    
-                    printf("KEYPAD: Drawing circle at (%.1f,%.1f) r=%.1f\n", cx, cy, radius);
-                    send_line(0, 0, 5, 5, 30);
-                    //draw_circle_spi(cx, cy, radius, 30.0f);
-                } else {
-                    printf("KEYPAD: Invalid plotter limits\n");
-                }
-            } else {
-                printf("KEYPAD: Need calibration and homing first!\n");
-            }
-            break;
-
-        case '4':  // Простой тест - движение по квадрату
-            printf("KEYPAD: Testing simple square movement\n");
-            if (plotter.is_calibrated && plotter.is_homed) {
-                // Простое движение по квадрату через G-код
-                sprintf(params, "X%d,Y%d", 50, 50);
-                send_to_stm32_cmd(CMD_G1_LINEAR, params);
-            }
             break;
             
         case '9':

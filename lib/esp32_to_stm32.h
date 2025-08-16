@@ -29,5 +29,6 @@ uint32_t plotter_send_cmd(command_id_t cmd_id, const char* params);
 uint8_t plotter_is_ready_to_receive_draw_stream_data(void);
 void plotter_send_draw_stream_data(const uint8_t* data, uint32_t size);
 void plotter_get_state(plotter_state_t *ps);
+void plotter_start_all_tasks(void);
 
 #endif

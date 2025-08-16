@@ -1,67 +1,108 @@
+#include <string.h>
 #include "spi_feeder.h"
-#include "plotter_hal.h"
+#include "esp32_to_stm32.h"
 #include "ring_buffer.h"
 #include "plotter_config.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#define SPI_CHUNK_SIZE 2048  // Размер блока для STM32 DMA
+#define SPI_CHUNK_SIZE 2048u   // размер блока для STM32 DMA
+#define FEEDER_PERIOD_MS  10   // период опроса
 
 static const char* TAG = "spi_feeder";
 
-static rb_t* s_rb = NULL;
-static uint32_t s_total_sent = 0;
-static uint32_t s_chunks_sent = 0;
+static rb_t*   s_rb             = NULL;
+static uint32_t s_total_sent    = 0;
+static uint32_t s_chunks_sent   = 0;
+
+static volatile bool s_finishing = false;   // получили запрос завершения (finish)
+static volatile bool s_flushed   = false;   // остаток отправлен, можно считать фидер idle
 
 static void spi_feeder_task(void* arg) {
     rb_t* rb = (rb_t*)arg;
     uint8_t chunk[SPI_CHUNK_SIZE];
-    
-    ESP_LOGI(TAG, "SPI feeder task started");
-    
-    // Ждём инициализации HAL
-    while (g_plotter_hal == NULL) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    
-    ESP_LOGI(TAG, "HAL available, starting feeder loop");
-    
-    while (1) {
+
+    ESP_LOGI(TAG, "SPI feeder task started (chunk=%u)", (unsigned)SPI_CHUNK_SIZE);
+
+    for (;;) {
+        // Если уже всё дожали — просто «дремлем»
+        if (s_finishing && s_flushed) {
+            vTaskDelay(pdMS_TO_TICKS(FEEDER_PERIOD_MS));
+            continue;
+        }
+
         // Проверяем готовность STM32
-        if (g_plotter_hal->is_ready()) {
-            size_t available = rb_used(rb);
-            
-            // Отправляем только полные чанки по 2048 байт
+        if (!plotter_is_ready_to_receive_draw_stream_data()) {
+            static uint32_t not_ready_ticks = 0;
+            if ((++not_ready_ticks % (1000/FEEDER_PERIOD_MS)) == 0) { // ~раз в секунду
+                ESP_LOGW(TAG, "STM32 not ready, rb_used=%u", (unsigned)rb_used(rb));
+            }
+            vTaskDelay(pdMS_TO_TICKS(FEEDER_PERIOD_MS));
+            continue;
+        }
+
+        size_t available = rb_used(rb);
+
+        // Обычный режим: шлём только полные 2048-байтные чанки
+        if (!s_finishing) {
             if (available >= SPI_CHUNK_SIZE) {
-                size_t read = rb_read(rb, chunk, SPI_CHUNK_SIZE);
-                
+                size_t read = rb_read_exact(rb, chunk, SPI_CHUNK_SIZE);
                 if (read == SPI_CHUNK_SIZE) {
-                    ESP_LOGI(TAG, "Sending chunk %lu (2048 bytes) to STM32", s_chunks_sent);
-                    
-                    // Отправляем через HAL
-                    g_plotter_hal->send_nibbles(chunk, SPI_CHUNK_SIZE);
-                    
+                    plotter_send_draw_stream_data(chunk, SPI_CHUNK_SIZE);
                     s_chunks_sent++;
                     s_total_sent += SPI_CHUNK_SIZE;
-                    
-                    ESP_LOGD(TAG, "Total sent: %lu bytes in %lu chunks", 
-                            s_total_sent, s_chunks_sent);
+                    ESP_LOGD(TAG, "sent chunk #%u, total=%u",
+                             (unsigned)s_chunks_sent, (unsigned)s_total_sent);
                 }
-            } else if (available > 0 && available < 100) {
-                // Если осталось мало данных и сессия завершается
-                // TODO: проверить флаг finish_requested из microros_bridge
-                ESP_LOGD(TAG, "Buffer has %zu bytes (waiting for more)", available);
+            } else {
+                // ждём накопления
+                vTaskDelay(pdMS_TO_TICKS(FEEDER_PERIOD_MS));
             }
-        } else {
-            // STM32 не готов
-            static int not_ready_count = 0;
-            if (++not_ready_count % 100 == 0) {  // Логируем раз в секунду
-                ESP_LOGW(TAG, "STM32 not ready, buffer: %zu bytes", rb_used(rb));
+            continue;
+        }
+
+        // Режим завершения: дожать всё, что осталось.
+        if (available >= SPI_CHUNK_SIZE) {
+            // Ещё есть полные чанки — отправляем их как обычно
+            size_t read = rb_read_exact(rb, chunk, SPI_CHUNK_SIZE);
+            if (read == SPI_CHUNK_SIZE) {
+                plotter_send_draw_stream_data(chunk, SPI_CHUNK_SIZE);
+                s_chunks_sent++;
+                s_total_sent += SPI_CHUNK_SIZE;
+                ESP_LOGD(TAG, "finish mode: sent full chunk, left=%u",
+                         (unsigned)rb_used(rb));
+            }
+            continue;
+        }
+
+        // Осталось < 2048 байт — финальный пэддинг-блок
+        if (available > 0) {
+            size_t remain = available;
+            // читаем все оставшиеся байты
+            size_t read = rb_read_exact(rb, chunk, remain);
+            if (read == remain) {
+                // дополняем нулями до 2048
+                memset(chunk + remain, 0, SPI_CHUNK_SIZE - remain);
+                plotter_send_draw_stream_data(chunk, SPI_CHUNK_SIZE);
+                s_chunks_sent++;
+                s_total_sent += SPI_CHUNK_SIZE;
+                ESP_LOGI(TAG, "flushed tail: %u+pad -> %u bytes, total=%u",
+                         (unsigned)remain, (unsigned)SPI_CHUNK_SIZE, (unsigned)s_total_sent);
+            } else {
+                // парадокс: used изменился, попробуем позже
+                vTaskDelay(pdMS_TO_TICKS(FEEDER_PERIOD_MS));
+                continue;
             }
         }
-        
-        vTaskDelay(pdMS_TO_TICKS(10));  // 100Hz опрос
+
+        // Если сюда дошли, буфер пуст — считаем, что дожали
+        if (rb_used(rb) == 0) {
+            s_flushed = true;
+            ESP_LOGI(TAG, "flush complete");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(FEEDER_PERIOD_MS));
     }
 }
 
@@ -70,22 +111,33 @@ void spi_feeder_start(rb_t* rb) {
         ESP_LOGE(TAG, "Cannot start feeder with NULL ring buffer");
         return;
     }
-    
     s_rb = rb;
-    s_total_sent = 0;
+    s_total_sent  = 0;
     s_chunks_sent = 0;
-    
+    s_finishing   = false;
+    s_flushed     = false;
+
     xTaskCreatePinnedToCore(
-        spi_feeder_task, 
-        "spi_feeder", 
-        4096, 
-        rb, 
-        6,  // Высокий приоритет для real-time передачи
-        NULL, 
+        spi_feeder_task,
+        "spi_feeder",
+        4096,
+        rb,
+        6,               // высокий приоритет под realtime-выдачу
+        NULL,
         tskNO_AFFINITY
     );
-    
-    ESP_LOGI(TAG, "SPI feeder started with %d byte chunks", SPI_CHUNK_SIZE);
+
+    ESP_LOGI(TAG, "SPI feeder started");
+}
+
+void spi_feeder_request_finish(void) {
+    s_finishing = true;
+    // После этого задача дожмёт остаток и установит s_flushed = true
+    ESP_LOGI(TAG, "finish requested");
+}
+
+bool spi_feeder_is_flushed(void) {
+    return s_flushed;
 }
 
 uint32_t spi_feeder_get_total_sent(void) {

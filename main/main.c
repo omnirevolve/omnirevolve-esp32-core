@@ -1,4 +1,7 @@
-#include "lib/esp32_to_stm32.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <stdio.h>
+#include "esp32_to_stm32.h"
 
 void app_main() {
     printf("ESP32 Plotter ESP32 Controller starting...\n");
