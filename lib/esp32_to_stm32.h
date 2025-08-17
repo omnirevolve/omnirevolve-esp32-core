@@ -2,7 +2,7 @@
 #define ESP32_TO_STM32_H
 
 #include <stdint.h>
-#include "../main/shared/cmd_ids.h"
+#include "shared/cmd_ids.h"
 
 typedef struct {
     volatile uint8_t is_connected;

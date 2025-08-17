@@ -6,7 +6,7 @@
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
-#include "../main/shared/cmd_ids.h"
+#include "shared/cmd_ids.h"
 //#include "u8g2.h"
 #include <math.h>
 
@@ -53,6 +53,10 @@
 #define CONNECT_TIMEOUT_MS     3000
 
 #define UART_BUFFER_SIZE 256
+
+#ifndef SPI_DMA_CH_AUTO
+#define SPI_DMA_CH_AUTO 1
+#endif
 
 static spi_device_handle_t stm32_spi = NULL;
 
@@ -192,9 +196,9 @@ uint32_t send_to_stm32_cmd(command_id_t cmd_id, const char* params) {
     }
     
     if (params && strlen(params) > 0) {
-        snprintf(full_msg, sizeof(full_msg), "%lu:%d:%s\n", plotter.request_counter, cmd_id, params);
+        snprintf(full_msg, sizeof(full_msg), "%u:%d:%s\n", plotter.request_counter, cmd_id, params);
     } else {
-        snprintf(full_msg, sizeof(full_msg), "%lu:%d\n", plotter.request_counter, cmd_id);
+        snprintf(full_msg, sizeof(full_msg), "%u:%d\n", plotter.request_counter, cmd_id);
     }
     if (cmd_id < CMD_DUMMY_ACTIVE_COMMANDS_DELIMITER)
     {
@@ -375,7 +379,7 @@ void process_stm32_response(const char* response) {
     uint32_t cmd_id;
     char data[256] = {0};
     
-    int parsed = sscanf(response, "%lu:%lu:%255s", &received_id, &cmd_id, data);
+    int parsed = sscanf(response, "%u:%u:%255s", &received_id, &cmd_id, data);
     
     // Если это валидный формат команды - обрабатываем
     if (parsed >= 2 && received_id > 0 && cmd_id < CMD_COUNT) {
@@ -409,19 +413,19 @@ void process_stm32_response(const char* response) {
                 uint32_t request_id = 0;
                 int cmd_state_int = CMD_NOT_PRESENTED;
                 
-                if (sscanf(data, "%lu:%d", &request_id, &cmd_state_int) == 2) {
+                if (sscanf(data, "%u:%d", &request_id, &cmd_state_int) == 2) {
                     CmdState_t cmd_state = (CmdState_t)cmd_state_int;
                     
                     // Обновляем статус только если это наша команда
                     if (plotter.current_cmd_status.request_id == request_id) {
                         if (plotter.current_cmd_status.cmd_state != cmd_state) {
-                            printf("Current command %lu status changed: %d -> %d\n", 
+                            printf("Current command %u status changed: %d -> %d\n", 
                                 request_id, plotter.current_cmd_status.cmd_state, cmd_state);
                             plotter.current_cmd_status.cmd_state = cmd_state;
                         }
                     } else if (request_id != 0) {
                         // Это другая команда - обновляем
-                        printf("Received status for command %lu: %d\n", request_id, cmd_state);
+                        printf("Received status for command %u: %d\n", request_id, cmd_state);
                         plotter.current_cmd_status.request_id = request_id;
                         plotter.current_cmd_status.cmd_state = cmd_state;
                     }
@@ -437,7 +441,7 @@ void process_stm32_response(const char* response) {
                 plotter.state.y_pos = -1;
             } else {
                 int32_t x_steps, y_steps;
-                sscanf(data, "X%ld:Y%ld", &x_steps, &y_steps);
+                sscanf(data, "X%d:Y%d", &x_steps, &y_steps);
                 plotter.state.x_pos = x_steps;
                 plotter.state.y_pos = y_steps;
             }
@@ -506,7 +510,7 @@ void process_stm32_response(const char* response) {
             }
                 
             default:
-                printf("Unknown cmd_id: %lu\n", cmd_id);
+                printf("Unknown cmd_id: %u\n", cmd_id);
                 break;
         }
     }
