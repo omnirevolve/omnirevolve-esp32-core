@@ -7,21 +7,23 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#define SPI_CHUNK_SIZE 2048u   // размер блока для STM32 DMA
-#define FEEDER_PERIOD_MS  10   // период опроса
+#define SPI_CHUNK_SIZE   2048u   // размер блока для STM32 DMA
+#define FEEDER_PERIOD_MS 10      // период опроса
 
 static const char* TAG = "spi_feeder";
 
-static rb_t*   s_rb             = NULL;
+static rb_t*    s_rb            = NULL;
 static uint32_t s_total_sent    = 0;
 static uint32_t s_chunks_sent   = 0;
 
 static volatile bool s_finishing = false;   // получили запрос завершения (finish)
 static volatile bool s_flushed   = false;   // остаток отправлен, можно считать фидер idle
 
+// избежать 2К локального массива на стеке задачи
+static uint8_t s_chunk_buf[SPI_CHUNK_SIZE];
+
 static void spi_feeder_task(void* arg) {
     rb_t* rb = (rb_t*)arg;
-    uint8_t chunk[SPI_CHUNK_SIZE];
 
     ESP_LOGI(TAG, "SPI feeder task started (chunk=%u)", (unsigned)SPI_CHUNK_SIZE);
 
@@ -47,9 +49,9 @@ static void spi_feeder_task(void* arg) {
         // Обычный режим: шлём только полные 2048-байтные чанки
         if (!s_finishing) {
             if (available >= SPI_CHUNK_SIZE) {
-                size_t read = rb_read_exact(rb, chunk, SPI_CHUNK_SIZE);
+                size_t read = rb_read_exact(rb, s_chunk_buf, SPI_CHUNK_SIZE);
                 if (read == SPI_CHUNK_SIZE) {
-                    plotter_send_draw_stream_data(chunk, SPI_CHUNK_SIZE);
+                    plotter_send_draw_stream_data(s_chunk_buf, SPI_CHUNK_SIZE);
                     s_chunks_sent++;
                     s_total_sent += SPI_CHUNK_SIZE;
                     ESP_LOGD(TAG, "sent chunk #%u, total=%u",
@@ -65,9 +67,9 @@ static void spi_feeder_task(void* arg) {
         // Режим завершения: дожать всё, что осталось.
         if (available >= SPI_CHUNK_SIZE) {
             // Ещё есть полные чанки — отправляем их как обычно
-            size_t read = rb_read_exact(rb, chunk, SPI_CHUNK_SIZE);
+            size_t read = rb_read_exact(rb, s_chunk_buf, SPI_CHUNK_SIZE);
             if (read == SPI_CHUNK_SIZE) {
-                plotter_send_draw_stream_data(chunk, SPI_CHUNK_SIZE);
+                plotter_send_draw_stream_data(s_chunk_buf, SPI_CHUNK_SIZE);
                 s_chunks_sent++;
                 s_total_sent += SPI_CHUNK_SIZE;
                 ESP_LOGD(TAG, "finish mode: sent full chunk, left=%u",
@@ -79,18 +81,15 @@ static void spi_feeder_task(void* arg) {
         // Осталось < 2048 байт — финальный пэддинг-блок
         if (available > 0) {
             size_t remain = available;
-            // читаем все оставшиеся байты
-            size_t read = rb_read_exact(rb, chunk, remain);
+            size_t read = rb_read_exact(rb, s_chunk_buf, remain);
             if (read == remain) {
-                // дополняем нулями до 2048
-                memset(chunk + remain, 0, SPI_CHUNK_SIZE - remain);
-                plotter_send_draw_stream_data(chunk, SPI_CHUNK_SIZE);
+                memset(s_chunk_buf + remain, 0, SPI_CHUNK_SIZE - remain);
+                plotter_send_draw_stream_data(s_chunk_buf, SPI_CHUNK_SIZE);
                 s_chunks_sent++;
                 s_total_sent += SPI_CHUNK_SIZE;
                 ESP_LOGI(TAG, "flushed tail: %u+pad -> %u bytes, total=%u",
                          (unsigned)remain, (unsigned)SPI_CHUNK_SIZE, (unsigned)s_total_sent);
             } else {
-                // парадокс: used изменился, попробуем позже
                 vTaskDelay(pdMS_TO_TICKS(FEEDER_PERIOD_MS));
                 continue;
             }
@@ -120,7 +119,7 @@ void spi_feeder_start(rb_t* rb) {
     xTaskCreatePinnedToCore(
         spi_feeder_task,
         "spi_feeder",
-        4096,
+        6144,     // было 4096: подняли, т.к. много логов + varargs
         rb,
         6,
         NULL,
@@ -132,7 +131,6 @@ void spi_feeder_start(rb_t* rb) {
 
 void spi_feeder_request_finish(void) {
     s_finishing = true;
-    // После этого задача дожмёт остаток и установит s_flushed = true
     ESP_LOGI(TAG, "finish requested");
 }
 

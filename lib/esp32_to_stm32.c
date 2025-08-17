@@ -616,6 +616,11 @@ void process_keypad_command(char key) {
             printf("KEYPAD: Starting homing\n");
             send_to_stm32_cmd(CMD_HOME, NULL);
             break;
+
+        case '3':
+            printf("KEYPAD: Starting homing\n");
+            send_to_stm32_cmd(CMD_DRAW_BEGIN, NULL);
+            break;
             
         case '9':
             printf("KEYPAD: Emergency STOP!\n");

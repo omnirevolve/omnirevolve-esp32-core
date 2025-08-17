@@ -14,6 +14,13 @@ void rb_init(rb_t *rb, uint8_t *mem, size_t size){
     rb->tail = 0;
 }
 
+void rb_reset(rb_t *rb){
+    portENTER_CRITICAL(&s_mux);
+    rb->head = 0;
+    rb->tail = 0;
+    portEXIT_CRITICAL(&s_mux);
+}
+
 size_t rb_used(const rb_t *rb){
     size_t head = rb->head, tail = rb->tail, size = rb->size;
     return (head >= tail) ? (head - tail) : (size - (tail - head));

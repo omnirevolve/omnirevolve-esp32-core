@@ -11,7 +11,8 @@ typedef struct {
 } rb_t;
 
 // Инициализация поверх внешнего массива mem[size]
-void   rb_init(rb_t *rb, uint8_t *mem, size_t size);
+void rb_init(rb_t *rb, uint8_t *mem, size_t size);
+void rb_reset(rb_t *rb);
 
 // Свободно/занято
 size_t rb_free_space(const rb_t *rb);
