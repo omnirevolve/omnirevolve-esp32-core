@@ -745,9 +745,9 @@ void plotter_get_state(plotter_state_t *ps) {
 }
 
 void plotter_start_all_tasks(void) {
-    xTaskCreate(stm32_uart_task, "stm32_uart", 4096, NULL, 5, NULL);
-    xTaskCreate(plotter_control_task, "plotter_control", 4096, NULL, 4, NULL);
-    xTaskCreate(keypad_task, "keypad", 4096, NULL, 3, NULL);
+    xTaskCreatePinnedToCore(stm32_uart_task, "stm32_uart", 4096, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(plotter_control_task, "plotter_control", 4096, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(keypad_task, "keypad", 4096, NULL, 3, NULL, 1);
 }
 
 // idf.py -p /dev/ttyUSB0 -b 115200 flash monitor

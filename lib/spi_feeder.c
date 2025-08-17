@@ -122,9 +122,9 @@ void spi_feeder_start(rb_t* rb) {
         "spi_feeder",
         4096,
         rb,
-        6,               // высокий приоритет под realtime-выдачу
+        6,
         NULL,
-        tskNO_AFFINITY
+        1
     );
 
     ESP_LOGI(TAG, "SPI feeder started");
