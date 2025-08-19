@@ -20,45 +20,21 @@
 #define STM32_SPI_MISO    12   // GPIO12 (not used but connected)
 #define STM32_SPI_CLK     14   // GPIO14
 #define STM32_SPI_CS      15   // GPIO15
-#define STM32_READY_PIN   21   // GPIO21 - READY signal from STM32
+#define STM32_READY1_PIN  21   // GPIO21 - READY1 signal from STM32
+#define STM32_READY2_PIN  2    // GPIO2 - READY2 signal from STM32
 // =============================== TEST STREAMING BEGIN 1 ===================================
-// --- Streaming protocol (must match STM32) ---
-#ifndef CHUNK
-// Размер кусочка DATA-пейлоада; 512 оптимально (низкий overhead).
-#define CHUNK 512
-#endif
 
 // В байте STREAM: low nibble -> [bit0:X_STEP][bit1:X_DIR+][bit2:Y_STEP][bit3:Y_DIR+]
 // high nibble -> тот же набор битов, но сдвинутый на +4 (чтобы опустить STEP).
 // Т.е. если X_STEP=1 в младшем полупериоде, то в старшем надо тоже поставить X_STEP=1.
 #define STEPS_PER_MM 40.0f     // синхронизировать со STM32 (PULSES_PER_REV=1600, 20T GT2 => ~40 steps/mm)
-#define STREAM_F_HZ  10000u    // частота тиков на STM32 (TIM4 Update)
-#define STREAM_STEP_US  6u     // ширина высокого уровня STEP, если понадобится в будущем
-#define STREAM_GUARD_US 6u
-#define STREAM_INV_MASK 0x00   // инверсий DIR нет (см. логику на STM32)
-
-// Отладочные параметры стрима
-#define STREAM_PRELOAD_BYTES   2000    // сколько байт закачать ДО START (≈0.4 c буфера на 10 кГц)
-#define STREAM_DATA_CHUNK      CHUNK   // размер одного кадра DATA
-#define STREAM_BYTES_PER_SEC   (STREAM_F_HZ/2)  // 1 байт = 2 ниббла => 5000 Б/с при 10 кГц
-#define STREAM_RATE_SAFETY_PC  98      // учёт overhead (%, 98% от теории)
-
-#define STREAM_CMD_REQUEST_MORE  0x14
-#define STREAM_CMD_END          0x15
-#define STREAM_CMD_ACK          0x16
 
 // Continuous streaming parameters
-#define CONTINUOUS_CHUNK_SIZE    2048   // Send 2KB chunks
-#define CONTINUOUS_BUFFER_SIZE   16384  // 16KB buffer for continuous data
 
 #define HEARTBEAT_PERIOD_MS    1000
 #define CONNECT_TIMEOUT_MS     3000
 
 #define UART_BUFFER_SIZE 256
-
-#ifndef SPI_DMA_CH_AUTO
-#define SPI_DMA_CH_AUTO 1
-#endif
 
 static spi_device_handle_t stm32_spi = NULL;
 
@@ -222,89 +198,6 @@ uint32_t send_to_stm32_cmd(command_id_t cmd_id, const char* params) {
     return plotter.request_counter++;
 }
 
-uint8_t is_stm32_ready(void) {
-    return gpio_get_level(STM32_READY_PIN) == 1;
-}
-
-void spi_send_nibbles(const uint8_t *data, size_t len)
-{
-    printf("\n=== SPI SEND NIBBLES ===\n");
-    printf("Sending %zu bytes via SPI\n", len);
-
-    if (!stm32_spi || !data || len == 0)
-    {
-        printf("ERROR: Invalid parameters for SPI send\n");
-        return;
-    }
-
-    // Проверка READY сигнала
-    int ready_wait = 0;
-    while (!is_stm32_ready() && ready_wait < 50)
-    {
-        vTaskDelay(pdMS_TO_TICKS(10));
-        ready_wait++;
-    }
-
-    if (!is_stm32_ready())
-    {
-        printf("ERROR: STM32 not ready after %dms wait\n", ready_wait * 10);
-        printf("READY pin state: %d\n", gpio_get_level(STM32_READY_PIN));
-        return;
-    }
-
-    printf("STM32 is ready, starting transfer\n");
-
-    // Отправляем данные кусками
-    size_t sent = 0;
-    int chunk_num = 0;
-
-    while (sent < len)
-    {
-        size_t chunk_size = (len - sent > SPI_CHUNK_SIZE) ? SPI_CHUNK_SIZE : (len - sent);
-
-        printf("  Chunk %d: sending %zu bytes (offset %zu)\n", chunk_num++, chunk_size, sent);
-
-        // Отладка: печать первых байт чанка
-        if (chunk_size > 0)
-        {
-            printf("    First bytes: ");
-            for (size_t i = 0; i < 4 && i < chunk_size; i++)
-            {
-                printf("%02X ", data[sent + i]);
-            }
-            printf("\n");
-        }
-
-        spi_transaction_t trans = {
-            .length = chunk_size * 8, // В битах
-            .tx_buffer = &data[sent],
-            .rx_buffer = NULL,
-            .flags = 0};
-
-        esp_err_t ret = spi_device_transmit(stm32_spi, &trans);
-        if (ret != ESP_OK)
-        {
-            printf("ERROR: SPI transmit failed: %s\n", esp_err_to_name(ret));
-            break;
-        }
-
-        sent += chunk_size;
-
-        // Проверяем READY после каждого чанка
-        if (sent < len)
-        {
-            vTaskDelay(pdMS_TO_TICKS(5));
-            if (!is_stm32_ready())
-            {
-                printf("WARNING: STM32 became not ready after %zu bytes\n", sent);
-                vTaskDelay(pdMS_TO_TICKS(50));
-            }
-        }
-    }
-
-    printf("SPI transfer complete: sent %zu/%zu bytes\n", sent, len);
-}
-
 // =========================== KEYPAD =============================
 
 void keypad_init(void) {
@@ -399,15 +292,30 @@ void process_stm32_response(const char* response) {
                 
             case CMD_GET_STATUS:
                 
-                printf("Processing CMD_GET_STATUS, data: %s\n", data);
+                //printf("Processing CMD_GET_STATUS, data: %s\n", data);
                 if (strlen(data) >= 4) {
-                    plotter.state.is_calibrated = (data[0] == '1');
-                    plotter.state.is_homed = (data[1] == '1');
-                    plotter.state.is_processing_cmd = (data[2] == '1');
-                    plotter.state.is_idle = (data[3] == '1');
-                    printf("Status updated: cal=%d, home=%d, proc=%d, idle=%d\n",
-                           plotter.state.is_calibrated, plotter.state.is_homed,
-                           plotter.state.is_processing_cmd, plotter.state.is_idle);
+                    bool show_log = false;
+                    bool v = (data[0] == '1');
+                    show_log |= plotter.state.is_calibrated != v;
+                    plotter.state.is_calibrated = v;
+
+                    v = (data[1] == '1');
+                    show_log |= plotter.state.is_homed != v;
+                    plotter.state.is_homed = v;
+
+                    v = (data[2] == '1');
+                    show_log |= plotter.state.is_processing_cmd != v;
+                    plotter.state.is_processing_cmd = v;
+
+                    v = (data[3] == '1');
+                    show_log |= plotter.state.is_idle != v;
+                    plotter.state.is_idle = v;
+
+                    if (show_log){
+                        printf("STM32 INNER STATE UPDATE: cal=%d, home=%d, proc=%d, idle=%d\n",
+                            plotter.state.is_calibrated, plotter.state.is_homed,
+                            plotter.state.is_processing_cmd, plotter.state.is_idle);
+                    }
                 }
                 break;
                 
@@ -536,7 +444,10 @@ void stm32_uart_task(void *pvParameters) {
             if (data == '\n' || data == '\r') {
                 if (pos > 0) {
                     buffer[pos] = '\0';
-                    printf("STM32 says:  '%s'\n", buffer);
+                    //if (strstr(buffer, "DEBUG:") != 0) {
+                        printf("STM32 says:  '%s'\n", buffer);
+                    //}
+
                     process_stm32_response(buffer);
                     pos = 0;
                 }
@@ -634,35 +545,47 @@ void process_keypad_command(char key) {
 }
 
 // ============ SPI & UART INIT ROUTINES ============
-
-static void stm32_spi_init(void)
-{
-    printf("\n=== STM32 SPI INITIALIZATION ===\n");
+static void config_ready_pins(void) {
     // Configure READY pin as input with pull-down
     gpio_config_t ready_conf = {
-        .pin_bit_mask = (1ULL << STM32_READY_PIN),
+        .pin_bit_mask = (1ULL << STM32_READY1_PIN),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_ENABLE,
         .intr_type = GPIO_INTR_DISABLE};
     gpio_config(&ready_conf);
-    printf("READY pin (GPIO%d) configured as input with pull-down\n", STM32_READY_PIN);
+    printf("READY1 pin (GPIO%d) configured as input with pull-down\n", STM32_READY1_PIN);
+
+    gpio_config_t ready_conf1 = {
+        .pin_bit_mask = (1ULL << STM32_READY2_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE};
+    gpio_config(&ready_conf1);
+    printf("READY2 pin (GPIO%d) configured as input with pull-down\n", STM32_READY2_PIN);
 
     // Test READY pin
-    int ready_state = gpio_get_level(STM32_READY_PIN);
-    printf("Initial READY pin state: %d\n", ready_state);
+    printf("Initial READY1 pin state: %d\n", gpio_get_level(STM32_READY1_PIN));
+    printf("Initial READY2 pin state: %d\n", gpio_get_level(STM32_READY2_PIN));
+}
+
+static void stm32_spi_init(void)
+{
+    printf("\n=== STM32 SPI INITIALIZATION ===\n");
 
     // Initialize SPI bus
     spi_bus_config_t buscfg = {
         .mosi_io_num = STM32_SPI_MOSI,
-        .miso_io_num = STM32_SPI_MISO,
+        .miso_io_num = -1,
         .sclk_io_num = STM32_SPI_CLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
         .max_transfer_sz = 2048,
+        //.isr_cpu_id = ESP_INTR_CPU_AFFINITY_1,
         .flags = SPICOMMON_BUSFLAG_MASTER};
 
-    esp_err_t ret = spi_bus_initialize(STM32_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    esp_err_t ret = spi_bus_initialize(STM32_SPI_HOST, &buscfg, 1);
     if (ret != ESP_OK)
     {
         printf("ERROR: SPI bus init failed: %s\n", esp_err_to_name(ret));
@@ -678,7 +601,7 @@ static void stm32_spi_init(void)
         .duty_cycle_pos = 128,             // 50% duty cycle
         .cs_ena_pretrans = 2,              // Setup time before transmission
         .cs_ena_posttrans = 2,             // Hold time after transmission
-        .clock_speed_hz = 1 * 1000 * 1000, // 1 MHz (reduced for stability)
+        .clock_speed_hz = 2 * 1000 * 1000,
         .input_delay_ns = 0,
         .spics_io_num = STM32_SPI_CS,
         .flags = 0,
@@ -696,11 +619,10 @@ static void stm32_spi_init(void)
     printf("STM32 SPI device added successfully\n");
     printf("Configuration:\n");
     printf("  MOSI: GPIO%d\n", STM32_SPI_MOSI);
-    printf("  MISO: GPIO%d\n", STM32_SPI_MISO);
     printf("  CLK:  GPIO%d\n", STM32_SPI_CLK);
-    printf("  CS:   GPIO%d\n", STM32_SPI_CS);
-    printf("  READY: GPIO%d\n", STM32_READY_PIN);
-    printf("  Speed: 1 MHz\n");
+    printf("  READY1: GPIO%d\n", STM32_READY1_PIN);
+    printf("  READY2: GPIO%d\n", STM32_READY2_PIN);
+    printf("  Speed: 10 MHz\n");
     printf("  Mode: 0 (CPOL=0, CPHA=0)\n");
 }
 
@@ -729,6 +651,7 @@ void plotter_init(void) {
     strcpy(plotter.last_command, "None");
     strcpy(plotter.status_text, "Initializing");
 
+    config_ready_pins();
     stm32_spi_init();
     uart_init();
 }
@@ -738,11 +661,45 @@ uint32_t plotter_send_cmd(command_id_t cmd_id, const char* params) {
 }
 
 uint8_t plotter_is_ready_to_receive_draw_stream_data(void) {
-    return is_stm32_ready();
+    static uint8_t last = 0xFF;
+
+    uint8_t r1 = gpio_get_level(STM32_READY1_PIN) ? 1 : 0;
+    uint8_t r2 = gpio_get_level(STM32_READY2_PIN) ? 1 : 0;
+    uint8_t cur = (r1 << 1) | r2;  // 00, 01, 10, 11
+
+
+    // Валидные «готовые» фазы — 01 и 10 (ровно один HIGH)
+    uint8_t event = 0;
+    if (cur == 0x1 || cur == 0x2) {
+        if (last != cur) {
+            event = 1;
+            printf("!!!! >>>>>>>  Detected transition: 0x%02X -> 0x%02X  <<<<<<<< !!!!", last, cur);
+        }
+    }
+    last = cur;
+    return event;
 }
 
-void plotter_send_draw_stream_data(const uint8_t* data, uint32_t size) {
-    spi_send_nibbles(data, size);
+void plotter_send_draw_stream_data(const uint8_t* data, uint32_t len) {
+    if (!stm32_spi || !data || len == 0)
+    {
+        printf("ERROR: Invalid parameters for SPI send\n");
+        return;
+    }
+    printf("INFO: sending draw data len = " PRIu32 " %d\n",len);
+
+    spi_transaction_t trans = {
+        .length = len * 8,
+        .tx_buffer = data,
+        .rx_buffer = NULL,
+        .flags = 0};
+
+    esp_err_t ret = spi_device_transmit(stm32_spi, &trans);
+    if (ret != ESP_OK)
+    {
+        printf("ERROR: SPI transmit failed: %s\n", esp_err_to_name(ret));
+    }
+    printf("INFO: sending draw data exited");
 }
 
 void plotter_get_state(plotter_state_t *ps) {
@@ -750,9 +707,9 @@ void plotter_get_state(plotter_state_t *ps) {
 }
 
 void plotter_start_all_tasks(void) {
-    xTaskCreatePinnedToCore(stm32_uart_task, "stm32_uart", 4096, NULL, 5, NULL, 1);
-    xTaskCreatePinnedToCore(plotter_control_task, "plotter_control", 4096, NULL, 4, NULL, 1);
-    xTaskCreatePinnedToCore(keypad_task, "keypad", 4096, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(stm32_uart_task, "stm32_uart", 4096, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(plotter_control_task, "plotter_control", 4096, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(keypad_task, "keypad", 4096, NULL, 2, NULL, 1);
 }
 
 // idf.py -p /dev/ttyUSB0 -b 115200 flash monitor
