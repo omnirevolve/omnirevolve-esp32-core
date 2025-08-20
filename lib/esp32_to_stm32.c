@@ -14,6 +14,8 @@
 //#include "u8g2.h"
 #include "driver/spi_master.h"
 
+//#define printf(...) do{}while(0)
+
 // SPI Configuration for STM32 communication
 #define STM32_SPI_HOST    HSPI_HOST
 #define STM32_SPI_MOSI    13   // GPIO13
@@ -34,7 +36,7 @@
 #define HEARTBEAT_PERIOD_MS    1000
 #define CONNECT_TIMEOUT_MS     3000
 
-#define UART_BUFFER_SIZE 256
+#define UART_BUFFER_SIZE 1024
 
 static spi_device_handle_t stm32_spi = NULL;
 
@@ -159,11 +161,13 @@ static keypad_state_t keypad_state = {
     .last_key_time = 0
 };
 
+static SemaphoreHandle_t s_plotter_io_devices_init_done = NULL;
+
 // =========================== PROTOTYPES =============================
 
 // =========================== STM32 IO ROUTINES =============================
 uint32_t send_to_stm32_cmd(command_id_t cmd_id, const char* params) {
-    char full_msg[128];
+    char full_msg[UART_BUFFER_SIZE];
     
     // Добавить проверку
     if (cmd_id >= CMD_COUNT) {
@@ -272,7 +276,7 @@ void keypad_task(void *pvParameters) {
 void process_stm32_response(const char* response) {
     uint32_t received_id;
     uint32_t cmd_id;
-    char data[256] = {0};
+    char data[UART_BUFFER_SIZE] = {0};
     
     int parsed = sscanf(response, "%" SCNu32 ":%" SCNu32 ":%255s",
                     &received_id, &cmd_id, data);
@@ -545,31 +549,6 @@ void process_keypad_command(char key) {
 }
 
 // ============ SPI & UART INIT ROUTINES ============
-static void config_ready_pins(void) {
-    // Configure READY pin as input with pull-down
-    gpio_config_t ready_conf = {
-        .pin_bit_mask = (1ULL << STM32_READY1_PIN),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_ENABLE,
-        .intr_type = GPIO_INTR_DISABLE};
-    gpio_config(&ready_conf);
-    printf("READY1 pin (GPIO%d) configured as input with pull-down\n", STM32_READY1_PIN);
-
-    gpio_config_t ready_conf1 = {
-        .pin_bit_mask = (1ULL << STM32_READY2_PIN),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_ENABLE,
-        .intr_type = GPIO_INTR_DISABLE};
-    gpio_config(&ready_conf1);
-    printf("READY2 pin (GPIO%d) configured as input with pull-down\n", STM32_READY2_PIN);
-
-    // Test READY pin
-    printf("Initial READY1 pin state: %d\n", gpio_get_level(STM32_READY1_PIN));
-    printf("Initial READY2 pin state: %d\n", gpio_get_level(STM32_READY2_PIN));
-}
-
 static void stm32_spi_init(void)
 {
     printf("\n=== STM32 SPI INITIALIZATION ===\n");
@@ -581,7 +560,7 @@ static void stm32_spi_init(void)
         .sclk_io_num = STM32_SPI_CLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = 2048,
+        .max_transfer_sz = SPI_CHUNK_SIZE,
         //.isr_cpu_id = ESP_INTR_CPU_AFFINITY_1,
         .flags = SPICOMMON_BUSFLAG_MASTER};
 
@@ -595,19 +574,11 @@ static void stm32_spi_init(void)
 
     // Add STM32 as SPI device
     spi_device_interface_config_t devcfg = {
-        .command_bits = 0,
-        .address_bits = 0,
-        .mode = 0,                         // SPI mode 0 (CPOL=0, CPHA=0)
-        .duty_cycle_pos = 128,             // 50% duty cycle
-        .cs_ena_pretrans = 2,              // Setup time before transmission
-        .cs_ena_posttrans = 2,             // Hold time after transmission
-        .clock_speed_hz = 2 * 1000 * 1000,
-        .input_delay_ns = 0,
+        .mode = 0,
+        .clock_speed_hz = 1 * 1000 * 1000, // реально 1 МГц — лог не должен говорить «10»
         .spics_io_num = STM32_SPI_CS,
-        .flags = 0,
-        .queue_size = 1,
-        .pre_cb = NULL,
-        .post_cb = NULL};
+        .queue_size = 8,
+    };
 
     ret = spi_bus_add_device(STM32_SPI_HOST, &devcfg, &stm32_spi);
     if (ret != ESP_OK)
@@ -622,8 +593,28 @@ static void stm32_spi_init(void)
     printf("  CLK:  GPIO%d\n", STM32_SPI_CLK);
     printf("  READY1: GPIO%d\n", STM32_READY1_PIN);
     printf("  READY2: GPIO%d\n", STM32_READY2_PIN);
-    printf("  Speed: 10 MHz\n");
+    printf("  Speed: %d Hz\n", devcfg.clock_speed_hz);
     printf("  Mode: 0 (CPOL=0, CPHA=0)\n");
+}
+
+static void config_ready_pins(ready_signal_isr_callback isr_callback)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << STM32_READY1_PIN,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_ANYEDGE
+    };
+    gpio_config(&io);
+
+    esp_err_t err = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(err);
+    }
+
+    ESP_ERROR_CHECK(gpio_isr_handler_add(STM32_READY1_PIN, isr_callback, NULL));
+    ESP_ERROR_CHECK(gpio_intr_enable(STM32_READY1_PIN));
 }
 
 void uart_init(void)
@@ -638,7 +629,7 @@ void uart_init(void)
         .source_clk = UART_SCLK_APB,
     };
     
-    uart_driver_install(STM32_UART_PORT, 2048, 2048, 0, NULL, 0);
+    uart_driver_install(STM32_UART_PORT, UART_BUFFER_SIZE, UART_BUFFER_SIZE, 0, NULL, 0);
     uart_param_config(STM32_UART_PORT, &uart_config);
     uart_set_pin(STM32_UART_PORT, STM32_TX_PIN, STM32_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
@@ -646,14 +637,27 @@ void uart_init(void)
 }
 
 // ============ HAL ROUTINES ============
-void plotter_init(void) {
+static void plotter_init_task(void *arg) {
+    ready_signal_isr_callback isr_callback = (ready_signal_isr_callback)arg;
+    printf("Initializing plotter hardware...\n");
     plotter.last_heartbeat_sent = 0;
     strcpy(plotter.last_command, "None");
     strcpy(plotter.status_text, "Initializing");
-
-    config_ready_pins();
     stm32_spi_init();
     uart_init();
+    config_ready_pins(isr_callback);
+    xSemaphoreGive(s_plotter_io_devices_init_done);
+    vTaskDelete(NULL);
+}
+
+void plotter_init_sync(ready_signal_isr_callback cb)
+{
+    if (!s_plotter_io_devices_init_done) {
+        s_plotter_io_devices_init_done = xSemaphoreCreateBinary();
+    }
+    xTaskCreatePinnedToCore(plotter_init_task, "plotter_io_devices_init",
+                            4096, (void*)cb, 9, NULL, 1);
+    xSemaphoreTake(s_plotter_io_devices_init_done, portMAX_DELAY);
 }
 
 uint32_t plotter_send_cmd(command_id_t cmd_id, const char* params) {
@@ -678,6 +682,15 @@ uint8_t plotter_is_ready_to_receive_draw_stream_data(void) {
     }
     last = cur;
     return event;
+}
+
+uint8_t plotter_get_ready_pins_state(void) {
+    static uint8_t last = 0xFF;
+
+    uint8_t r1 = gpio_get_level(STM32_READY1_PIN) ? 1 : 0;
+    uint8_t r2 = gpio_get_level(STM32_READY2_PIN) ? 1 : 0;
+    uint8_t cur = (r1 << 1) | r2;  // 00, 01, 10, 11
+    return cur;
 }
 
 void plotter_send_draw_stream_data(const uint8_t* data, uint32_t len) {
@@ -707,9 +720,9 @@ void plotter_get_state(plotter_state_t *ps) {
 }
 
 void plotter_start_all_tasks(void) {
-    xTaskCreatePinnedToCore(stm32_uart_task, "stm32_uart", 4096, NULL, 4, NULL, 1);
-    xTaskCreatePinnedToCore(plotter_control_task, "plotter_control", 4096, NULL, 3, NULL, 1);
-    xTaskCreatePinnedToCore(keypad_task, "keypad", 4096, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(stm32_uart_task, "stm32_uart", 4096, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(plotter_control_task, "plotter_control", 4096, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(keypad_task, "keypad", 4096, NULL, 1, NULL, 1);
 }
 
 // idf.py -p /dev/ttyUSB0 -b 115200 flash monitor
