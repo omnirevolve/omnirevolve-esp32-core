@@ -11,10 +11,8 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "shared/cmd_ids.h"
-//#include "u8g2.h"
-#include "driver/spi_master.h"
+#include "driver/spi_master.h" 
 
-//#define printf(...) do{}while(0)
 
 // SPI Configuration for STM32 communication
 #define STM32_SPI_HOST    HSPI_HOST
@@ -26,14 +24,9 @@
 #define STM32_READY2_PIN  2    // GPIO2 - READY2 signal from STM32
 // =============================== TEST STREAMING BEGIN 1 ===================================
 
-// В байте STREAM: low nibble -> [bit0:X_STEP][bit1:X_DIR+][bit2:Y_STEP][bit3:Y_DIR+]
-// high nibble -> тот же набор битов, но сдвинутый на +4 (чтобы опустить STEP).
-// Т.е. если X_STEP=1 в младшем полупериоде, то в старшем надо тоже поставить X_STEP=1.
-#define STEPS_PER_MM 40.0f     // синхронизировать со STM32 (PULSES_PER_REV=1600, 20T GT2 => ~40 steps/mm)
-
 // Continuous streaming parameters
 
-#define HEARTBEAT_PERIOD_MS    1000
+#define HEARTBEAT_PERIOD_MS    1000 
 #define CONNECT_TIMEOUT_MS     3000
 
 #define UART_BUFFER_SIZE 1024
@@ -42,17 +35,11 @@ static spi_device_handle_t stm32_spi = NULL;
 
 const char* command_names[CMD_COUNT] = {
     "INVALID",
-    "HOME",
     "CALIBRATE", 
+    "CMD_HOME",
     "EMERGENCY_STOP",
-    "MOVE_TO",
-    "G0_RAPID",
-    "G1_LINEAR",
-    "G28_HOME",
-    "RESET_SYSTEM",
     "PEN_UP",
     "PEN_DOWN",
-    "SET_PEN",
     "SET_COLOR",
     "GET_COLOR",
     "DRAW_BEGIN",
@@ -61,44 +48,22 @@ const char* command_names[CMD_COUNT] = {
     "HEARTBEAT",
     "GET_STATUS",
     "GET_POSITION",
-    "SET_SPEED",
-    "SET_ACCELERATION",
-    "M114_POSITION",
-    "M112_EMERGENCY",
-    "M220_SPEED_FACTOR",
     "GET_LIMITS",
-    "SET_ORIGIN",
-    "GET_DIAGNOSTICS",
-    "GET_CMD_STATUS",
-    "G90_ABSOLUTE",
-    "G91_RELATIVE"
+    "GET_CMD_STATUS"
 };
-
-// Hardware pins for OLED
-#define PIN_NUM_MOSI 23
-#define PIN_NUM_CLK  18
-#define PIN_NUM_CS   5
-#define PIN_NUM_DC   17
-#define PIN_NUM_RST  16
 
 // UART to STM32
 #define STM32_UART_PORT UART_NUM_2
 #define STM32_TX_PIN 25  // GPIO25
-#define STM32_RX_PIN 26  // GPIO26
+#define STM32_RX_PIN 26  // GPIO26 
 
 
-// Добавить в начало файла ESP32
 #define KEYPAD_ROWS 4
 #define KEYPAD_COLS 4
 
-#define STEPS_PER_MM  40.0f
-#define MM_PER_STEP   (1.0f / STEPS_PER_MM)
+static const int row_pins[KEYPAD_ROWS] = {32, 33, 27};
+static const int col_pins[KEYPAD_COLS] = {22, 4, 19};
 
-// GPIO пины для клавиатуры (можно изменить под вашу схему)
-static const int row_pins[KEYPAD_ROWS] = {32, 33, 27}; // Выходы (строки)
-static const int col_pins[KEYPAD_COLS] = {22, 4, 19};  // Входы (столбцы)
-
-// Матрица символов клавиатуры
 static const char keypad_keys[KEYPAD_ROWS][KEYPAD_COLS] = {
     {'1', '2', '3'},
     {'4', '5', '6'},
@@ -126,7 +91,7 @@ typedef struct {
 
     uint8_t heartbeat_ok;
     char status_text[64];
-    char last_command[64];  // Increased from 32
+    char last_command[64];
     char last_response[64];
     volatile CurrentCommand_t current_cmd_status;
     volatile uint32_t request_counter;
@@ -205,13 +170,12 @@ uint32_t send_to_stm32_cmd(command_id_t cmd_id, const char* params) {
 // =========================== KEYPAD =============================
 
 void keypad_init(void) {
-    // Настройка пинов строк как выходы
     for (int i = 0; i < KEYPAD_ROWS; i++) {
         gpio_set_direction(row_pins[i], GPIO_MODE_OUTPUT);
-        gpio_set_level(row_pins[i], 1); // HIGH по умолчанию
+        gpio_set_level(row_pins[i], 1); // HIGH by default
     }
     
-    // Настройка пинов столбцов как входы с подтяжкой
+    // input, pull-up:
     for (int i = 0; i < KEYPAD_COLS; i++) {
         gpio_set_direction(col_pins[i], GPIO_MODE_INPUT);
         gpio_set_pull_mode(col_pins[i], GPIO_PULLUP_ONLY);
@@ -222,40 +186,28 @@ void keypad_init(void) {
 
 char keypad_scan(void) {
     for (int row = 0; row < KEYPAD_ROWS; row++) {
-        // Устанавливаем текущую строку в LOW
-        gpio_set_level(row_pins[row], 0);
-        
-        // Небольшая задержка для стабилизации
-        vTaskDelay(pdMS_TO_TICKS(1));
-        
-        // Проверяем все столбцы
-        for (int col = 0; col < KEYPAD_COLS; col++) {
-            if (gpio_get_level(col_pins[col]) == 0) {
-                // Кнопка нажата
-                gpio_set_level(row_pins[row], 1); // Восстанавливаем HIGH
+        gpio_set_level(row_pins[row], 0); // row -> LOW
+        vTaskDelay(pdMS_TO_TICKS(1)); // stab delay
+        for (int col = 0; col < KEYPAD_COLS; col++) { // check columns:
+            if (gpio_get_level(col_pins[col]) == 0) { // button pressed
+                gpio_set_level(row_pins[row], 1); // resume HIGH
                 return keypad_keys[row][col];
             }
         }
-        
-        // Восстанавливаем HIGH для этой строки
-        gpio_set_level(row_pins[row], 1);
+        gpio_set_level(row_pins[row], 1); // resumed HIGH for the row
     }
-    
-    return 0; // Ничего не нажато
+    return 0;
 }
 
 void process_keypad_command(char key);
 
 void keypad_task(void *pvParameters) {
     printf("Keypad task started\n");
-    
     keypad_init();
-    
     while (1) {
         char key = keypad_scan();
-        
         if (key != 0) {
-            // Debounce - игнорируем повторные нажатия в течение 200мс
+            // Debounce in 200ms
             uint32_t current_time = xTaskGetTickCount();
             if (key != keypad_state.last_key || 
                 (current_time - keypad_state.last_key_time) > pdMS_TO_TICKS(200)) {
@@ -265,10 +217,9 @@ void keypad_task(void *pvParameters) {
                 keypad_state.last_key_time = current_time;
             }
         } else {
-            keypad_state.last_key = 0; // Кнопка отпущена
+            keypad_state.last_key = 0;
         }
-        
-        vTaskDelay(pdMS_TO_TICKS(50)); // Сканируем каждые 50мс
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -281,7 +232,6 @@ void process_stm32_response(const char* response) {
     int parsed = sscanf(response, "%" SCNu32 ":%" SCNu32 ":%255s",
                     &received_id, &cmd_id, data);
     
-    // Если это валидный формат команды - обрабатываем
     if (parsed >= 2 && received_id > 0 && cmd_id < CMD_COUNT) {
         if (cmd_id != CMD_GET_CMD_STATUS && cmd_id != CMD_GET_STATUS && cmd_id != CMD_HEARTBEAT)
             printf("<- STM32: %s\n", response);
@@ -295,8 +245,6 @@ void process_stm32_response(const char* response) {
                 break;
                 
             case CMD_GET_STATUS:
-                
-                //printf("Processing CMD_GET_STATUS, data: %s\n", data);
                 if (strlen(data) >= 4) {
                     bool show_log = false;
                     bool v = (data[0] == '1');
@@ -331,7 +279,6 @@ void process_stm32_response(const char* response) {
                 if (sscanf(data, "%" SCNu32 ":%d", &request_id, &cmd_state_int) == 2) {
                     CmdState_t cmd_state = (CmdState_t)cmd_state_int;
                     
-                    // Обновляем статус только если это наша команда
                     if (plotter.current_cmd_status.request_id == request_id) {
                         if (plotter.current_cmd_status.cmd_state != cmd_state) {
                             printf("Current command %" PRIu32 " status changed: %d -> %d\n",
@@ -339,7 +286,6 @@ void process_stm32_response(const char* response) {
                             plotter.current_cmd_status.cmd_state = cmd_state;
                         }
                     } else if (request_id != 0) {
-                        // Это другая команда - обновляем
                         printf("Received status for command %" PRIu32 ": %d\n",
                             request_id, cmd_state);
                         plotter.current_cmd_status.request_id = request_id;
@@ -376,41 +322,21 @@ void process_stm32_response(const char* response) {
                 }
                 break;
                     
-            case CMD_GET_DIAGNOSTICS: {
-                int pen_state;
-                sscanf(data, "PEN:%d,FEED:%hu,SF:%f", 
-                    &pen_state, &plotter.state.feedrate, &plotter.state.speed_factor);
-                plotter.state.pen_is_down = (pen_state == 1);
-                break;
-            }
-                
             case CMD_GET_COLOR:
                 sscanf(data, "C%hhu:%15s", &plotter.state.current_color, plotter.state.color_name);
                 break;
                 
             case CMD_CALIBRATE:
             case CMD_HOME:
-            case CMD_G28_HOME:
             case CMD_EMERGENCY_STOP:
-            case CMD_M112_EMERGENCY:
-            case CMD_MOVE_TO:
-            case CMD_G0_RAPID:
-            case CMD_G1_LINEAR:
-            case CMD_SET_SPEED:
-            case CMD_M220_SPEED_FACTOR:
-            case CMD_SET_ORIGIN:
-            case CMD_RESET_SYSTEM:
             case CMD_PEN_UP:
             case CMD_PEN_DOWN:
-            case CMD_SET_PEN:
             case CMD_SET_COLOR:
             case CMD_DRAW_BEGIN: {
-                // Command acknowledged - check response
                 if (strcmp(data, "OK") == 0) {
                     printf("Command %s started\n", command_names[cmd_id]);
                 } else if (strcmp(data, "DONE") == 0) {
                     printf("Command %s completed\n", command_names[cmd_id]);
-                    // Обновляем статус команды на FINISHED
                     if (plotter.current_cmd_status.request_id == received_id) {
                         plotter.current_cmd_status.cmd_state = CMD_FINISHED;
                     }
@@ -444,14 +370,10 @@ void stm32_uart_task(void *pvParameters) {
 
     while (1) {
         if (uart_read_bytes(STM32_UART_PORT, &data, 1, pdMS_TO_TICKS(100)) == 1) {
-            // Normal text processing
             if (data == '\n' || data == '\r') {
                 if (pos > 0) {
                     buffer[pos] = '\0';
-                    //if (strstr(buffer, "DEBUG:") != 0) {
-                        printf("STM32 says:  '%s'\n", buffer);
-                    //}
-
+                    printf("STM32 says:  '%s'\n", buffer);
                     process_stm32_response(buffer);
                     pos = 0;
                 }
@@ -483,35 +405,24 @@ void plotter_control_task(void *pvParameters) {
     plotter.last_heartbeat_sent = xTaskGetTickCount();
     
     while (1) {
-        // Поддержка связи: периодические отправки
         TickType_t now = xTaskGetTickCount();
-
-        // HEARTBEAT раз в секунду
         if ((now - plotter.last_heartbeat_sent) >= pdMS_TO_TICKS(HEARTBEAT_PERIOD_MS)) {
             send_to_stm32_cmd(CMD_HEARTBEAT, NULL);
             plotter.last_heartbeat_sent = now;
         }
-
-        // Запрос статуса раз в секунду
         if ((now - plotter.last_status_request) >= pdMS_TO_TICKS(1000)) {
             send_to_stm32_cmd(CMD_GET_STATUS, NULL);
             plotter.last_status_request = now;
         }
-
-        // Watchdog связи: если давно не было ответов — считаем, что отключились
         TickType_t last_alive = (plotter.last_rx_heartbeat > plotter.last_rx_any)
                                 ? plotter.last_rx_heartbeat
                                 : plotter.last_rx_any;
-
         bool prev_connected = plotter.state.is_connected;
         plotter.state.is_connected = (last_alive != 0) &&
                             ((now - last_alive) <= pdMS_TO_TICKS(CONNECT_TIMEOUT_MS));
-
-        // (опционально) логируем только смену состояния
         if (prev_connected != plotter.state.is_connected) {
             printf("[link] is_connected = %s\n", plotter.state.is_connected ? "true" : "false");
         }
-
         vTaskDelay(pdMS_TO_TICKS(50));    
     }
 }
@@ -533,15 +444,25 @@ void process_keypad_command(char key) {
             break;
 
         case '3':
-            printf("KEYPAD: Starting homing\n");
-            send_to_stm32_cmd(CMD_DRAW_BEGIN, NULL);
+            printf("KEYPAD: Set color #0\n");
+            send_to_stm32_cmd(CMD_SET_COLOR, "C0");
             break;
-            
-        case '9':
-            printf("KEYPAD: Emergency STOP!\n");
-            send_to_stm32_cmd(CMD_EMERGENCY_STOP, NULL);
+
+        case '4':
+            printf("KEYPAD: Set color #1\n");
+            send_to_stm32_cmd(CMD_SET_COLOR, "C1");
             break;
-            
+
+        case '5':
+            printf("KEYPAD: Set color #2\n");
+            send_to_stm32_cmd(CMD_SET_COLOR, "C2");
+            break;
+
+        case '6':
+            printf("KEYPAD: Set color #2\n");
+            send_to_stm32_cmd(CMD_SET_COLOR, "C3");
+            break;
+
         default:
             printf("KEYPAD: Unknown key\n");
             break;
@@ -561,7 +482,6 @@ static void stm32_spi_init(void)
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
         .max_transfer_sz = SPI_CHUNK_SIZE,
-        //.isr_cpu_id = ESP_INTR_CPU_AFFINITY_1,
         .flags = SPICOMMON_BUSFLAG_MASTER};
 
     esp_err_t ret = spi_bus_initialize(STM32_SPI_HOST, &buscfg, 1);
@@ -575,7 +495,7 @@ static void stm32_spi_init(void)
     // Add STM32 as SPI device
     spi_device_interface_config_t devcfg = {
         .mode = 0,
-        .clock_speed_hz = 1 * 1000 * 1000, // реально 1 МГц — лог не должен говорить «10»
+        .clock_speed_hz = 8 * 1000 * 1000,
         .spics_io_num = STM32_SPI_CS,
         .queue_size = 8,
     };
@@ -664,35 +584,6 @@ uint32_t plotter_send_cmd(command_id_t cmd_id, const char* params) {
     return send_to_stm32_cmd(cmd_id, params);
 }
 
-uint8_t plotter_is_ready_to_receive_draw_stream_data(void) {
-    static uint8_t last = 0xFF;
-
-    uint8_t r1 = gpio_get_level(STM32_READY1_PIN) ? 1 : 0;
-    uint8_t r2 = gpio_get_level(STM32_READY2_PIN) ? 1 : 0;
-    uint8_t cur = (r1 << 1) | r2;  // 00, 01, 10, 11
-
-
-    // Валидные «готовые» фазы — 01 и 10 (ровно один HIGH)
-    uint8_t event = 0;
-    if (cur == 0x1 || cur == 0x2) {
-        if (last != cur) {
-            event = 1;
-            printf("!!!! >>>>>>>  Detected transition: 0x%02X -> 0x%02X  <<<<<<<< !!!!", last, cur);
-        }
-    }
-    last = cur;
-    return event;
-}
-
-uint8_t plotter_get_ready_pins_state(void) {
-    static uint8_t last = 0xFF;
-
-    uint8_t r1 = gpio_get_level(STM32_READY1_PIN) ? 1 : 0;
-    uint8_t r2 = gpio_get_level(STM32_READY2_PIN) ? 1 : 0;
-    uint8_t cur = (r1 << 1) | r2;  // 00, 01, 10, 11
-    return cur;
-}
-
 void plotter_send_draw_stream_data(const uint8_t* data, uint32_t len) {
     if (!stm32_spi || !data || len == 0)
     {
@@ -724,7 +615,3 @@ void plotter_start_all_tasks(void) {
     xTaskCreatePinnedToCore(plotter_control_task, "plotter_control", 4096, NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(keypad_task, "keypad", 4096, NULL, 1, NULL, 1);
 }
-
-// idf.py -p /dev/ttyUSB0 -b 115200 flash monitor
-//. ~/esp-idf/export.sh
-

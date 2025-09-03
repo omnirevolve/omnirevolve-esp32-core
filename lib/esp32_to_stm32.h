@@ -28,13 +28,9 @@ typedef void (*ready_signal_isr_callback)(void *arg);
 
 void plotter_init(void);
 uint32_t plotter_send_cmd(command_id_t cmd_id, const char* params);
-uint8_t plotter_is_ready_to_receive_draw_stream_data(void);
-uint8_t plotter_get_ready_pins_state(void);
 void plotter_send_draw_stream_data(const uint8_t* data, uint32_t len);
 void plotter_get_state(plotter_state_t *ps);
 void plotter_start_all_tasks(void);
 void plotter_init_sync(ready_signal_isr_callback cb);
-
-
 
 #endif
