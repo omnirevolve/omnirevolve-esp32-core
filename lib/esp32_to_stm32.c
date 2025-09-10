@@ -4,6 +4,7 @@
 #include <string.h>
 #include <inttypes.h>
 #include <math.h>
+#include <errno.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -224,6 +225,13 @@ void keypad_task(void *pvParameters) {
 }
 
 // ========================= UART COMMANDS CONTROL ROUTINES ===============
+static int hexval(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
 void process_stm32_response(const char* response) {
     uint32_t received_id;
     uint32_t cmd_id;
@@ -244,33 +252,48 @@ void process_stm32_response(const char* response) {
                 plotter.last_rx_heartbeat = now;
                 break;
                 
-            case CMD_GET_STATUS:
-                if (strlen(data) >= 4) {
-                    bool show_log = false;
-                    bool v = (data[0] == '1');
-                    show_log |= plotter.state.is_calibrated != v;
-                    plotter.state.is_calibrated = v;
+            case CMD_GET_STATUS: {
+                // Ожидаем строку "HH:DDDD..." (2 hex-цифры + ':' + десятичный uint32)
+                const char *p = data;
+                if (p && strlen(p) >= 4) {
+                    int h1 = hexval((unsigned char)p[0]);
+                    int h2 = hexval((unsigned char)p[1]);
+                    if (h1 >= 0 && h2 >= 0 && p[2] == ':') {
+                        uint8_t status = (uint8_t)((h1 << 4) | h2);
 
-                    v = (data[1] == '1');
-                    show_log |= plotter.state.is_homed != v;
-                    plotter.state.is_homed = v;
+                        // Битовая схема (STM32->ESP32):
+                        // bit7 (0x80): is_calibrated
+                        // bit6 (0x40): is_homed
+                        // bit5 (0x20): терминальное состояние команды (не в PlotterTelemetry, но можно держать в state)
+                        // bit4 (0x10): поток рисования активен (не в PlotterTelemetry)
 
-                    v = (data[2] == '1');
-                    show_log |= plotter.state.is_processing_cmd != v;
-                    plotter.state.is_processing_cmd = v;
+                        bool new_is_cal       = (status & 0x80u) != 0;
+                        bool new_is_home      = (status & 0x40u) != 0;
+                        bool new_is_terminal  = (status & 0x20u) != 0;
+                        bool new_stream_active= (status & 0x10u) != 0;
 
-                    v = (data[3] == '1');
-                    show_log |= plotter.state.is_idle != v;
-                    plotter.state.is_idle = v;
+                        errno = 0;
+                        char *endp = NULL;
+                        unsigned long v = strtoul(p + 3, &endp, 10);
+                        if (errno == 0 && endp != p + 3 && *endp == '\0' && v <= UINT32_MAX) {
+                            plotter.state.is_calibrated   = (uint8_t)new_is_cal;
+                            plotter.state.is_homed        = (uint8_t)new_is_home;
+                            plotter.state.bytes_processed = (uint32_t)v;
 
-                    if (show_log){
-                        printf("STM32 INNER STATE UPDATE: cal=%d, home=%d, proc=%d, idle=%d\n",
-                            plotter.state.is_calibrated, plotter.state.is_homed,
-                            plotter.state.is_processing_cmd, plotter.state.is_idle);
+                            plotter.state.is_processing_cmd = new_stream_active ? 1 : 0;
+                            plotter.state.is_idle           = (!new_stream_active && new_is_terminal) ? 1 : 0;
+                        } else {
+                            printf("ERROR: GET_STATUS bytes parse failed: %s\n", p);
+                        }
+                    } else {
+                        printf("ERROR: GET_STATUS header parse failed: %s\n", p);
                     }
+                } else {
+                    printf("ERROR: GET_STATUS too short: %s\n", p ? p : "<null>");
                 }
                 break;
-                
+            }
+
             case CMD_GET_CMD_STATUS:
             {
                 uint32_t request_id = 0;

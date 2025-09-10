@@ -11,12 +11,15 @@ typedef struct {
     volatile uint8_t is_homed;
     volatile uint8_t is_processing_cmd;
     volatile uint8_t is_idle;
-    
+
     volatile int32_t x_pos;
     volatile int32_t y_pos;
+
+    volatile uint32_t bytes_processed;
+
     volatile float x_max;
     volatile float y_max;
-    
+
     volatile uint8_t pen_is_down;
     volatile uint8_t current_color;
     volatile char color_name[16];
