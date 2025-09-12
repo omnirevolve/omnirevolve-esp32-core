@@ -36,4 +36,6 @@ void plotter_get_state(plotter_state_t *ps);
 void plotter_start_all_tasks(void);
 void plotter_init_sync(ready_signal_isr_callback cb);
 
+
+
 #endif

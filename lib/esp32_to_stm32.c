@@ -20,9 +20,9 @@
 #define STM32_SPI_MOSI    13   // GPIO13
 #define STM32_SPI_MISO    12   // GPIO12 (not used but connected)
 #define STM32_SPI_CLK     14   // GPIO14
-#define STM32_SPI_CS      15   // GPIO15
-#define STM32_READY1_PIN  21   // GPIO21 - READY1 signal from STM32
-#define STM32_READY2_PIN  2    // GPIO2 - READY2 signal from STM32
+//#define STM32_SPI_CS      15   // GPIO15
+
+#define STM32_READY_PIN   15   // GPIO15 - READY signal from STM32
 // =============================== TEST STREAMING BEGIN 1 ===================================
 
 // Continuous streaming parameters
@@ -44,7 +44,6 @@ const char* command_names[CMD_COUNT] = {
     "SET_COLOR",
     "GET_COLOR",
     "DRAW_BEGIN",
-    "DRAW_FINISH_WHEN_EMPTY",
     "DUMMY_ACTIVE_COMMANDS_DELIMITER",
     "HEARTBEAT",
     "GET_STATUS",
@@ -59,8 +58,8 @@ const char* command_names[CMD_COUNT] = {
 #define STM32_RX_PIN 26  // GPIO26 
 
 
-#define KEYPAD_ROWS 4
-#define KEYPAD_COLS 4
+#define KEYPAD_ROWS 3
+#define KEYPAD_COLS 3
 
 static const int row_pins[KEYPAD_ROWS] = {32, 33, 27};
 static const int col_pins[KEYPAD_COLS] = {22, 4, 19};
@@ -88,7 +87,6 @@ typedef struct {
     TickType_t last_status_request;
     TickType_t last_rx_any;
     TickType_t last_rx_heartbeat;
-    TickType_t last_ready_request;
 
     uint8_t heartbeat_ok;
     char status_text[64];
@@ -117,7 +115,6 @@ static plotter_manager_t plotter = {
     .last_status_request = 0,
     .last_rx_any = 0,
     .last_rx_heartbeat = 0,
-    .last_ready_request = 0,
     .heartbeat_ok = 0,
     .request_counter = 1
 };
@@ -519,7 +516,7 @@ static void stm32_spi_init(void)
     spi_device_interface_config_t devcfg = {
         .mode = 0,
         .clock_speed_hz = 8 * 1000 * 1000,
-        .spics_io_num = STM32_SPI_CS,
+        .spics_io_num = -1,
         .queue_size = 8,
     };
 
@@ -534,19 +531,18 @@ static void stm32_spi_init(void)
     printf("Configuration:\n");
     printf("  MOSI: GPIO%d\n", STM32_SPI_MOSI);
     printf("  CLK:  GPIO%d\n", STM32_SPI_CLK);
-    printf("  READY1: GPIO%d\n", STM32_READY1_PIN);
-    printf("  READY2: GPIO%d\n", STM32_READY2_PIN);
+    printf("  Ready pin: GPIO%d\n", STM32_READY_PIN);
     printf("  Speed: %d Hz\n", devcfg.clock_speed_hz);
     printf("  Mode: 0 (CPOL=0, CPHA=0)\n");
 }
 
-static void config_ready_pins(ready_signal_isr_callback isr_callback)
+static void config_ready_pin(ready_signal_isr_callback isr_callback)
 {
     gpio_config_t io = {
-        .pin_bit_mask = 1ULL << STM32_READY1_PIN,
+        .pin_bit_mask = 1ULL << STM32_READY_PIN,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_ANYEDGE
     };
     gpio_config(&io);
@@ -556,8 +552,8 @@ static void config_ready_pins(ready_signal_isr_callback isr_callback)
         ESP_ERROR_CHECK(err);
     }
 
-    ESP_ERROR_CHECK(gpio_isr_handler_add(STM32_READY1_PIN, isr_callback, NULL));
-    ESP_ERROR_CHECK(gpio_intr_enable(STM32_READY1_PIN));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(STM32_READY_PIN, isr_callback, NULL));
+    ESP_ERROR_CHECK(gpio_intr_enable(STM32_READY_PIN));
 }
 
 void uart_init(void)
@@ -588,7 +584,7 @@ static void plotter_init_task(void *arg) {
     strcpy(plotter.status_text, "Initializing");
     stm32_spi_init();
     uart_init();
-    config_ready_pins(isr_callback);
+    config_ready_pin(isr_callback);
     xSemaphoreGive(s_plotter_io_devices_init_done);
     vTaskDelete(NULL);
 }
@@ -613,7 +609,7 @@ void plotter_send_draw_stream_data(const uint8_t* data, uint32_t len) {
         printf("ERROR: Invalid parameters for SPI send\n");
         return;
     }
-    printf("INFO: sending draw data len = " PRIu32 " %d\n",len);
+    printf("INFO: sending draw data len = %" PRIu32 "\n",len);
 
     spi_transaction_t trans = {
         .length = len * 8,
@@ -626,7 +622,7 @@ void plotter_send_draw_stream_data(const uint8_t* data, uint32_t len) {
     {
         printf("ERROR: SPI transmit failed: %s\n", esp_err_to_name(ret));
     }
-    printf("INFO: sending draw data exited");
+    printf("INFO: sending draw data exited\n");
 }
 
 void plotter_get_state(plotter_state_t *ps) {
