@@ -27,6 +27,29 @@ typedef struct {
     volatile float speed_factor;
 } plotter_state_t;
 
+// ======================= OLED DISPLAY SECTION =======================
+typedef enum {
+    WIFI_STATE_DISCONNECTED = 0,
+    WIFI_STATE_CONNECTING,
+    WIFI_STATE_CONNECTED,
+    WIFI_STATE_AP_MODE,
+    WIFI_STATE_ERROR
+} wifi_state_t;
+
+typedef struct {
+    wifi_state_t wifi_state;
+    char wifi_ssid[32];
+    char ip_address[16];
+    int8_t wifi_rssi;
+} oled_wifi_info_t;
+
+void oled_init(void);
+void oled_update_wifi_status(wifi_state_t state, const char *ssid, const char *ip, int8_t rssi);
+void oled_update_plotter_status(const plotter_state_t *state);
+void oled_show_message(const char *message, uint32_t duration_ms);
+void oled_task(void *pvParameters);
+// ======================= END OLED SECTION =======================
+
 typedef void (*ready_signal_isr_callback)(void *arg);
 
 void plotter_init(void);
@@ -35,7 +58,5 @@ void plotter_send_draw_stream_data(const uint8_t* data, uint32_t len);
 void plotter_get_state(plotter_state_t *ps);
 void plotter_start_all_tasks(void);
 void plotter_init_sync(ready_signal_isr_callback cb);
-
-
 
 #endif
