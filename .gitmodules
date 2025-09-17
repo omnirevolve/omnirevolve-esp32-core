@@ -8,3 +8,7 @@
 	path = components/omnirevolve-protocol
 	url = git@github.com:IvanNekrasov/omnirevolve-protocol.git
 	branch = main
+[submodule "components/omnirevolve_protocol"]
+	path = components/omnirevolve_protocol
+	url = git@github.com:IvanNekrasov/omnirevolve-protocol.git
+	branch = main
