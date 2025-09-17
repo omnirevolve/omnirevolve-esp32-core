@@ -20,7 +20,7 @@
 #if __has_include("esp_rom_sys.h")
   #include "esp_rom_sys.h"   // ets_delay_us() on newer IDF
 #else
-  #include "rom/ets_sys.h"   // ets_delay_us() on older IDF
+  #include "esp32/rom/ets_sys.h"   // ets_delay_us() on older IDF
 #endif
 
 // Wi-Fi state polling is now done inside the OLED task
@@ -79,6 +79,14 @@ const char* command_names[CMD_COUNT] = {
 static const int row_pins[KEYPAD_ROWS] = {32, 33, 27};
 static const int col_pins[KEYPAD_COLS] = {22, 4, 19};
 
+typedef enum {
+    CURRENT_CMD_IDLE = 0,
+    CURRENT_CMD_CALIBRATING,
+    CURRENT_CMD_HOMING,
+    CURRENT_CMD_DRAWING,
+    CURRENT_CMD_ERROR
+} CurrentCmd_t;
+
 static const char keypad_keys[KEYPAD_ROWS][KEYPAD_COLS] = {
     {'1', '2', '3'},
     {'4', '5', '6'},
@@ -100,6 +108,8 @@ typedef struct {
 
     TickType_t last_heartbeat_sent;
     TickType_t last_status_request;
+    TickType_t last_position_request;
+    TickType_t last_cmd_status_request;
     TickType_t last_rx_any;
     TickType_t last_rx_heartbeat;
 
@@ -123,11 +133,11 @@ static plotter_manager_t plotter = {
     .state.y_max = 0,
     .state.pen_is_down = 0,
     .state.current_color = 0,
-    .state.feedrate = 3000,
-    .state.speed_factor = 1.0,
+    .state.current_cmd = CURRENT_CMD_IDLE,
 
     .last_heartbeat_sent = 0,
     .last_status_request = 0,
+    .last_position_request = 0,
     .last_rx_any = 0,
     .last_rx_heartbeat = 0,
     .heartbeat_ok = 0,
@@ -193,11 +203,23 @@ void keypad_task(void *pvParameters) {
 }
 
 // ======================= OLED DISPLAY (U8g2 over HW SPI / VSPI) =======================
-#if __has_include("esp_rom_sys.h")
-  #include "esp_rom_sys.h"
-#else
-  #include "rom/ets_sys.h"
-#endif
+typedef enum {
+    WIFI_STATE_DISCONNECTED = 0,
+    WIFI_STATE_CONNECTING,
+    WIFI_STATE_CONNECTED,
+    WIFI_STATE_AP_MODE,
+    WIFI_STATE_ERROR
+} wifi_state_t;
+
+typedef struct {
+    wifi_state_t wifi_state;
+    char wifi_ssid[32];
+    char ip_address[16];
+    int8_t wifi_rssi;
+} oled_wifi_info_t;
+
+// ======================= END OLED SECTION =======================
+
 
 #define OLED_SPI_HOST   VSPI_HOST
 #define OLED_PIN_MOSI   23
@@ -210,14 +232,12 @@ void keypad_task(void *pvParameters) {
 #define OLED_HEIGHT     64
 
 static u8g2_t u8g2;
-static SemaphoreHandle_t oled_mutex = NULL;
 static oled_wifi_info_t wifi_info = {0};
 static char oled_temp_message[64] = {0};
 static TickType_t oled_message_timeout = 0;
-static uint8_t oled_initialized = 0;
+static volatile uint8_t oled_initialized = 0;
 
 static spi_device_handle_t s_oled_spi = NULL;
-static plotter_state_t s_plotter_cached = {0};
 
 // --- U8g2 byte callback: driver controls CS; we only set DC and send bytes ---
 static uint8_t u8x8_byte_hw_spi(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
@@ -308,11 +328,6 @@ void oled_init(void)
 {
     if (oled_initialized) return;
 
-    if (!oled_mutex) {
-        oled_mutex = xSemaphoreCreateMutex();
-        if (!oled_mutex) { printf("[OLED] mutex create failed\n"); return; }
-    }
-
     oled_spi_bus_init();
     oled_hw_reset();
 
@@ -326,50 +341,37 @@ void oled_init(void)
     u8g2_InitDisplay(&u8g2);
     u8g2_SetPowerSave(&u8g2, 0);
     u8g2_ClearBuffer(&u8g2);
-    u8g2_SetFont(&u8g2, u8g2_font_6x10_tf);
+    u8g2_SetFont(&u8g2, u8g2_font_4x6_mf);
 
     oled_initialized = 1;
     printf("[OLED] ready (VSPI: MOSI=%d SCK=%d CS=%d DC=%d RST=%d)\n",
            OLED_PIN_MOSI, OLED_PIN_SCK, OLED_PIN_CS, OLED_PIN_DC, OLED_PIN_RST);
 
-    u8g2_DrawStr(&u8g2, 0, 10, "Plotter OLED Ready");
+    u8g2_DrawStr(&u8g2, 0, 10, "Start uROS-agent on PC-node");
+    u8g2_DrawStr(&u8g2, 0, 18, "and restart me (ESP32)");
     u8g2_SendBuffer(&u8g2);
 }
 
 // --- Public status update APIs (kept for external use if needed) ---
 void oled_update_wifi_status(wifi_state_t state, const char *ssid, const char *ip, int8_t rssi)
 {
-    if (!oled_initialized || !oled_mutex) return;
-    if (xSemaphoreTake(oled_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        wifi_info.wifi_state = state;
-        if (ssid) strncpy(wifi_info.wifi_ssid, ssid, sizeof(wifi_info.wifi_ssid) - 1);
-        if (ip)   strncpy(wifi_info.ip_address, ip, sizeof(wifi_info.ip_address) - 1);
-        wifi_info.wifi_rssi = rssi;
-        xSemaphoreGive(oled_mutex);
-    }
-}
-
-void oled_update_plotter_status(const plotter_state_t *state)
-{
-    if (!oled_initialized || !state) return;
-    if (xSemaphoreTake(oled_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        s_plotter_cached = *state;
-        xSemaphoreGive(oled_mutex);
-    }
+    if (!oled_initialized) return;
+    wifi_info.wifi_state = state;
+    if (ssid) strncpy(wifi_info.wifi_ssid, ssid, sizeof(wifi_info.wifi_ssid) - 1);
+    if (ip)   strncpy(wifi_info.ip_address, ip, sizeof(wifi_info.ip_address) - 1);
+    wifi_info.wifi_rssi = rssi;
 }
 
 void oled_show_message(const char *message, uint32_t duration_ms)
 {
-    if (!oled_initialized || !oled_mutex) return;
-    if (xSemaphoreTake(oled_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        if (message) {
-            strncpy(oled_temp_message, message, sizeof(oled_temp_message) - 1);
-            oled_message_timeout = xTaskGetTickCount() + pdMS_TO_TICKS(duration_ms);
-        } else {
-            oled_temp_message[0] = '\0';
-            oled_message_timeout = 0;
-        }
-        xSemaphoreGive(oled_mutex);
+    if (!oled_initialized) return;
+
+    if (message) {
+        strncpy(oled_temp_message, message, sizeof(oled_temp_message) - 1);
+        oled_message_timeout = xTaskGetTickCount() + pdMS_TO_TICKS(duration_ms);
+    } else {
+        oled_temp_message[0] = '\0';
+        oled_message_timeout = 0;
     }
 }
 
@@ -424,6 +426,17 @@ static void oled_poll_wifi_and_update(void)
     oled_update_wifi_status(state, ssid, ip_str, rssi);
 }
 
+static char* get_current_plotter_task() {
+    switch (plotter.state.current_cmd) {
+        case CURRENT_CMD_IDLE: return "IDL";
+        case CURRENT_CMD_CALIBRATING: return "CAL";
+        case CURRENT_CMD_DRAWING: return "DRW";
+        case CURRENT_CMD_HOMING: return "HOM";
+        case CURRENT_CMD_ERROR: return "ERR";
+    }
+    return "?";
+}
+
 // --- Rendering ---
 static void oled_draw(void)
 {
@@ -432,56 +445,51 @@ static void oled_draw(void)
     u8g2_ClearBuffer(&u8g2);
 
     if (oled_message_timeout > xTaskGetTickCount() && oled_temp_message[0] != '\0') {
-        u8g2_SetFont(&u8g2, u8g2_font_7x13_tf);
+        //u8g2_SetFont(&u8g2, u8g2_font_7x13_tf);
         int w = u8g2_GetStrWidth(&u8g2, oled_temp_message);
         u8g2_DrawStr(&u8g2, (OLED_WIDTH - w) / 2, 32, oled_temp_message);
         u8g2_SendBuffer(&u8g2);
         return;
     }
 
-    u8g2_SetFont(&u8g2, u8g2_font_6x10_tf);
-    int y = 10;
-    const int delta_y = 11;
+    //u8g2_SetFont(&u8g2, u8g2_font_6x10_tf);
+    int y = 7;
+    const int delta_y = 8;
     char buf[64];
 
-    const char *wifi_str = "WiFi: Unknown";
-    switch (wifi_info.wifi_state) {
-        case WIFI_STATE_DISCONNECTED: wifi_str = "WiFi: Disconnected"; break;
-        case WIFI_STATE_CONNECTING:   wifi_str = "WiFi: Connecting..."; break;
-        case WIFI_STATE_CONNECTED:    wifi_str = "WiFi: Connected"; break;
-        case WIFI_STATE_AP_MODE:      wifi_str = "WiFi: AP Mode"; break;
-        case WIFI_STATE_ERROR:        wifi_str = "WiFi: Error"; break;
-    }
-
-    u8g2_DrawStr(&u8g2, 0, y, wifi_str); y += delta_y;
-
-    if (wifi_info.wifi_state == WIFI_STATE_CONNECTED) {
-        // snprintf(buf, sizeof(buf), "SSID: %.14s", wifi_info.wifi_ssid);
-        // u8g2_DrawStr(&u8g2, 0, y, buf); y += delta_y;
-        // snprintf(buf, sizeof(buf), "IP: %s", wifi_info.ip_address);
-        // u8g2_DrawStr(&u8g2, 0, y, buf); y += delta_y;
-        snprintf(buf, sizeof(buf), "RSSI: %d dBm", wifi_info.wifi_rssi);
+    if (wifi_info.wifi_state != WIFI_STATE_CONNECTED) {
+        const char *wifi_str = "WiFi: -";
+        switch (wifi_info.wifi_state) {
+            case WIFI_STATE_DISCONNECTED: wifi_str = "WiFi: d/c"; break;
+            case WIFI_STATE_CONNECTING:   wifi_str = "WiFi: ..."; break;
+            case WIFI_STATE_AP_MODE:      wifi_str = "WiFi: AP"; break;
+            case WIFI_STATE_ERROR:        wifi_str = "WiFi: ER"; break;
+            default: wifi_str = "WiFi: ?"; break;
+        }
+        u8g2_DrawStr(&u8g2, 0, y, wifi_str); y += delta_y;
+    } else {
+        snprintf(buf, sizeof(buf), "WiFi: %d dBm", wifi_info.wifi_rssi);
         u8g2_DrawStr(&u8g2, 0, y, buf); y += delta_y;
     }
 
     //u8g2_DrawHLine(&u8g2, 0, y + 1, OLED_WIDTH); y += 5;
 
-    snprintf(buf, sizeof(buf), "STM32: %s", s_plotter_cached.is_connected ? "Connected" : "Disconnected");
-    u8g2_DrawStr(&u8g2, 0, y, buf); y += delta_y;
-
-    if (s_plotter_cached.is_connected) {
-        snprintf(buf, sizeof(buf), "Clbrtd:%d Hmd:%d Busy:%d",
-                 s_plotter_cached.is_calibrated ? 1 : 0,
-                 s_plotter_cached.is_homed ? 1 : 0,
-                 s_plotter_cached.is_processing_cmd ? 1 : 0);
+    if (!plotter.state.is_connected) {
+        snprintf(buf, sizeof(buf), "STM32: Disconnected");
+        u8g2_DrawStr(&u8g2, 0, y, buf); y += delta_y;
+    } else {
+        snprintf(buf, sizeof(buf), "STM32: CAL:%d HOM:%d CMD:%s",
+                 plotter.state.is_calibrated ? 1 : 0,
+                 plotter.state.is_homed ? 1 : 0,
+                 get_current_plotter_task());
         u8g2_DrawStr(&u8g2, 0, y, buf); y += delta_y;
 
-        if (s_plotter_cached.is_connected) {
-            snprintf(buf, sizeof(buf), "Pos: X%ld Y%ld", (long)s_plotter_cached.x_pos, (long)s_plotter_cached.y_pos);
+        snprintf(buf, sizeof(buf), "Pos: X%ld Y%ld", (long)plotter.state.x_pos, (long)plotter.state.y_pos);
+        u8g2_DrawStr(&u8g2, 0, y, buf); y += delta_y;
+
+        if (plotter.state.current_cmd == CURRENT_CMD_DRAWING) {
+            snprintf(buf, sizeof(buf), "DRW: %u", plotter.state.bytes_processed);
             u8g2_DrawStr(&u8g2, 0, y, buf); y += delta_y;
-        }
-        else {
-            snprintf(buf, sizeof(buf), "Pos: X? Y?");
         }
     }
 
@@ -491,37 +499,34 @@ static void oled_draw(void)
 void oled_task(void *pvParameters)
 {
     printf("[OLED] task started\n");
-    vTaskDelay(pdMS_TO_TICKS(500));
-    oled_init();
 
-    if (!oled_initialized) {
-        printf("[OLED] init failed, exit\n");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    TickType_t last_wifi_poll = 0;
+    const TickType_t draw_period  = pdMS_TO_TICKS(200);   // 5 Гц отрисовка
+    const TickType_t wifi_period  = pdMS_TO_TICKS(2000);  // 0.5 Гц опрос Wi-Fi
+    TickType_t last_draw = xTaskGetTickCount();
+    TickType_t last_wifi = last_draw;
 
     for (;;) {
-        // 1) Poll Wi-Fi state every 2s (outside of the draw mutex)
-        TickType_t now = xTaskGetTickCount();
-        if ((now - last_wifi_poll) >= pdMS_TO_TICKS(2000)) {
-            oled_poll_wifi_and_update();
-            // also refresh cached plotter state for the screen
-            plotter_state_t ps;
-            plotter_get_state(&ps);
-            oled_update_plotter_status(&ps);
-            last_wifi_poll = now;
+        if (!oled_initialized) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
         }
 
-        // 2) Render the screen
-        if (oled_mutex && xSemaphoreTake(oled_mutex, pdMS_TO_TICKS(300)) == pdTRUE) {
-            oled_draw();
-            xSemaphoreGive(oled_mutex);
+        TickType_t now = xTaskGetTickCount();
+
+        if ((now - last_wifi) >= wifi_period) {
+            oled_poll_wifi_and_update();
+            last_wifi = now;
         }
-        vTaskDelay(pdMS_TO_TICKS(300));
+
+        if ((now - last_draw) >= draw_period) {
+            oled_draw();
+            last_draw = now;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
+
 // ======================= END OLED DISPLAY =======================
 
 
@@ -581,7 +586,7 @@ uint32_t send_to_stm32_cmd(command_id_t cmd_id, const char* params)
 
     switch (cmd_id) {
         case CMD_SET_COLOR: {
-            // params expected like "C<n>" in old text mode -> keep only index
+            // params expected like "C<n>" -> keep only index
             uint8_t idx = 0;
             if (params && (params[0]=='C' || params[0]=='c')) {
                 int v = atoi(params+1);
@@ -611,7 +616,7 @@ uint32_t send_to_stm32_cmd(command_id_t cmd_id, const char* params)
     // Track current command state for active commands
     if (cmd_id < CMD_DUMMY_ACTIVE_COMMANDS_DELIMITER) {
         plotter.current_cmd_status.request_id = plotter.request_counter;
-        plotter.current_cmd_status.cmd_state  = CMD_NOT_PRESENTED;
+        plotter.current_cmd_status.cmd_state  = PLOTTER_CMD_STATE__UNDEFINED;
     }
 
     // Keep last command name (optional)
@@ -628,6 +633,21 @@ static rx_ctx_t srx;
 
 static void rx_reset(void){ memset(&srx, 0, sizeof(srx)); srx.st = RX_SYNC0; }
 
+static void process_cmd_response(uint8_t status, uint32_t req_id) {
+    if (plotter.current_cmd_status.request_id == req_id) {
+        if (status == RESP_ACK) {
+            plotter.current_cmd_status.cmd_state = PLOTTER_CMD_STATE__RECEIVED;
+        } else if (status == RESP_DONE) {
+            plotter.current_cmd_status.cmd_state = PLOTTER_CMD_STATE__FINISHED;
+            plotter.state.current_cmd = CURRENT_CMD_IDLE;
+        } else if (status == RESP_BUSY) {
+            // leave as is, UI can poll again
+        } else if (status == RESP_ERR) {
+            plotter.state.current_cmd = CURRENT_CMD_ERROR;
+            plotter.current_cmd_status.cmd_state = PLOTTER_CMD_STATE__FAILED;
+        }
+    }
+}
 // ---- Handle CTRL_RESP payload (STM32 -> ESP32) ----
 static void handle_ctrl_resp(const uint8_t *p, uint16_t n)
 {
@@ -660,7 +680,25 @@ static void handle_ctrl_resp(const uint8_t *p, uint16_t n)
                 plotter.state.is_idle           = (!new_stream_active && new_is_terminal) ? 1 : 0;
             }
             break;
+            
+        case CMD_GET_CMD_STATUS:
+            // Payload format: [query_req_id(4)][cmd_state(1)]
+            if (dlen >= 5) {
+                uint32_t qid = rd_u32le(d + 0);
+                uint8_t  st  = d[4]; // values from CmdState_t enum
 
+                // Update only if it is about our current command
+                if (plotter.current_cmd_status.request_id == qid) {
+                    plotter.current_cmd_status.cmd_state = (CmdState_t)st;
+
+                    if (st == PLOTTER_CMD_STATE__FINISHED) {
+                        plotter.state.current_cmd = CURRENT_CMD_IDLE;
+                    } else if (st == PLOTTER_CMD_STATE__FAILED) {
+                        plotter.state.current_cmd = CURRENT_CMD_ERROR;
+                    }
+                }
+            }
+            break;
         case CMD_GET_POSITION:
             if (dlen >= 8) {
                 int32_t xs = (int32_t)rd_u32le(d+0);
@@ -690,24 +728,35 @@ static void handle_ctrl_resp(const uint8_t *p, uint16_t n)
             break;
 
         case CMD_CALIBRATE:
+            process_cmd_response(status, req_id);
+            if (status == RESP_ACK) {
+                plotter.state.current_cmd = CURRENT_CMD_CALIBRATING;
+            }
+            if (status == RESP_DONE) {
+                send_to_stm32_cmd(CMD_GET_LIMITS, NULL);
+            }
+            break;
+
         case CMD_HOME:
+            process_cmd_response(status, req_id);
+            if (status == RESP_ACK) {
+                plotter.state.current_cmd = CURRENT_CMD_HOMING;
+            }
+            break;
+
         case CMD_DRAW_BEGIN:
+            process_cmd_response(status, req_id);
+            if (status == RESP_ACK) {
+                plotter.state.current_cmd = CURRENT_CMD_DRAWING;
+            }
+            break;
+
         case CMD_PEN_UP:
         case CMD_PEN_DOWN:
         case CMD_SET_COLOR:
         case CMD_EMERGENCY_STOP:
+            process_cmd_response(status, req_id);
             // translate status to old cmd_state
-            if (plotter.current_cmd_status.request_id == req_id) {
-                if (status == RESP_ACK) {
-                    plotter.current_cmd_status.cmd_state = CMD_RECEIVED;
-                } else if (status == RESP_DONE) {
-                    plotter.current_cmd_status.cmd_state = CMD_FINISHED;
-                } else if (status == RESP_BUSY) {
-                    // leave as is, UI can poll again
-                } else if (status == RESP_ERR) {
-                    plotter.current_cmd_status.cmd_state = CMD_FAILED;
-                }
-            }
             break;
 
         default:
@@ -792,6 +841,24 @@ void plotter_control_task(void *pvParameters) {
             send_to_stm32_cmd(CMD_GET_STATUS, NULL);
             plotter.last_status_request = now;
         }
+        if ((now - plotter.last_position_request) >= pdMS_TO_TICKS(500)) {
+            send_to_stm32_cmd(CMD_GET_POSITION, NULL);
+            plotter.last_position_request = now;
+        }
+
+        if ((now - plotter.last_cmd_status_request) >= pdMS_TO_TICKS(500)) {
+            plotter.last_cmd_status_request = now;
+            const CmdState_t cs = plotter.current_cmd_status.cmd_state;
+            const bool cmd_active = (cs == PLOTTER_CMD_STATE__RECEIVED || cs == PLOTTER_CMD_STATE__EXECUTING);
+
+            if (cmd_active) {
+                char p[16];
+                snprintf(p, sizeof(p), "%u", (uint32_t)plotter.current_cmd_status.request_id);
+                send_to_stm32_cmd(CMD_GET_CMD_STATUS, p);
+                plotter.last_cmd_status_request = now;
+            }
+        }
+
         TickType_t last_alive = (plotter.last_rx_heartbeat > plotter.last_rx_any)
                                 ? plotter.last_rx_heartbeat
                                 : plotter.last_rx_any;
@@ -940,6 +1007,7 @@ static void plotter_init_task(void *arg) {
     strcpy(plotter.last_command, "None");
     strcpy(plotter.status_text, "Initializing");
     stm32_spi_init();
+    oled_init();
     uart_init();
     config_ready_pin(isr_callback);
     xSemaphoreGive(s_plotter_io_devices_init_done);
@@ -990,5 +1058,5 @@ void plotter_start_all_tasks(void) {
     xTaskCreatePinnedToCore(stm32_uart_task, "stm32_uart", 4096, NULL, 3, NULL, 1);
     xTaskCreatePinnedToCore(plotter_control_task, "plotter_control", 4096, NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(keypad_task, "keypad", 4096, NULL, 1, NULL, 1);
-    xTaskCreatePinnedToCore(oled_task, "oled_display", 1536, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(oled_task, "oled_display", 4096, NULL, 1, NULL, 1);
 }
