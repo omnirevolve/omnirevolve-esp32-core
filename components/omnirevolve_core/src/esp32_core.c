@@ -198,14 +198,42 @@ static void on_uart_debug(const char *line) {
 
 // ------------- Keypad integration -------------
 static void on_key(char key) {
-    switch (key) {
-        case '1': plotter_send_cmd(CMD_CALIBRATE, NULL); break;
-        case '2': plotter_send_cmd(CMD_HOME, NULL); break;
-        case '3': plotter_send_cmd(CMD_SET_COLOR, "C0"); break;
-        case '4': plotter_send_cmd(CMD_SET_COLOR, "C1"); break;
-        case '5': plotter_send_cmd(CMD_SET_COLOR, "C2"); break;
-        case '6': plotter_send_cmd(CMD_SET_COLOR, "C3"); break;
-        default: break;
+    printf("\n=== KEYPAD: Key '%c' pressed ===\n", key);
+
+    switch(key) {
+        case '1':
+            printf("KEYPAD: Starting calibration\n");
+            plotter_send_cmd(CMD_CALIBRATE, NULL);
+            break;
+
+        case '2':
+            printf("KEYPAD: Starting homing\n");
+            plotter_send_cmd(CMD_HOME, NULL);
+            break;
+
+        case '3':
+            printf("KEYPAD: Set color #0\n");
+            plotter_send_cmd(CMD_SET_COLOR, "C0");
+            break;
+
+        case '4':
+            printf("KEYPAD: Set color #1\n");
+            plotter_send_cmd(CMD_SET_COLOR, "C1");
+            break;
+
+        case '5':
+            printf("KEYPAD: Set color #2\n");
+            plotter_send_cmd(CMD_SET_COLOR, "C2");
+            break;
+
+        case '6':
+            printf("KEYPAD: Set color #3\n");
+            plotter_send_cmd(CMD_SET_COLOR, "C3");
+            break;
+
+        default:
+            printf("KEYPAD: Unknown key\n");
+            break;
     }
 }
 
@@ -295,7 +323,7 @@ static void init_task(void *arg) {
 
 void plotter_init_sync(ready_signal_isr_callback cb) {
     if (!s_init_done) s_init_done = xSemaphoreCreateBinary();
-    xTaskCreatePinnedToCore(init_task, "plotter_io_init", 4096, (void*)cb, 9, NULL, 1);
+    xTaskCreatePinnedToCore(init_task, "plotter_io_init", 8192*2, (void*)cb, 9, NULL, 1);
     xSemaphoreTake(s_init_done, portMAX_DELAY);
 }
 

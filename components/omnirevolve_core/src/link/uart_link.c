@@ -13,6 +13,7 @@
 
 static uart_port_t s_port = UART_NUM_2;
 static uint32_t s_req_counter = 1;
+static rx_ctx_t srx;
 
 static uart_resp_cb_t s_resp_cb = NULL;
 static uart_debug_cb_t s_dbg_cb = NULL;
@@ -110,10 +111,13 @@ static void handle_debug_text(const uint8_t *p, uint16_t n) {
     s_dbg_cb(line);
 }
 
+static void rx_reset(void){ memset(&srx, 0, sizeof(srx)); srx.st = RX_SYNC0; }
+
 static void rx_task(void *arg) {
     (void)arg;
     printf("[uart_link] RX task\n");
-    rx_ctx_t srx; memset(&srx, 0, sizeof(srx)); srx.st = RX_SYNC0;
+    rx_reset();
+
     uint8_t b;
     for (;;) {
         int got = uart_read_bytes(s_port, &b, 1, pdMS_TO_TICKS(100));
@@ -129,17 +133,23 @@ static void rx_task(void *arg) {
                         srx.payload[srx.idx++] = b;
                         srx.crc_calc = crc16_ccitt_step(srx.crc_calc, b);
                         if (srx.idx >= srx.len) srx.st = RX_CRC_HI;
-                    } else { memset(&srx, 0, sizeof(srx)); srx.st = RX_SYNC0; }
+                    } else {
+                        // overflow -> resync
+                        rx_reset();
+                    }
                     break;
                 case RX_CRC_HI:
-                    srx.crc_hi = b; srx.st = RX_CRC_LO; break;
+                    srx.crc_hi = b;
+                    srx.st = RX_CRC_LO;
+                    break;
                 case RX_CRC_LO: {
                     uint16_t crc_recv = ((uint16_t)srx.crc_hi<<8) | b;
                     if (crc_recv == srx.crc_calc) {
                         if (srx.type == UFR_TYPE_RESP)      { if (s_resp_cb) s_resp_cb(srx.payload, srx.len); }
-                        else if (srx.type == UFR_TYPE_DEBUG){ handle_debug_text(srx.payload, srx.len); }
+                        else if (srx.type == UFR_TYPE_DEBUG)handle_debug_text(srx.payload, srx.len);
+                        // ignore unknown types
                     }
-                    memset(&srx, 0, sizeof(srx)); srx.st = RX_SYNC0;
+                    rx_reset();
                     break;
                 }
             }
