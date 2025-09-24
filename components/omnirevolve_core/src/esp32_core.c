@@ -301,6 +301,10 @@ void plotter_start_all_tasks(void) {
     xTaskCreatePinnedToCore(control_task, "plotter_control", 4096, NULL, 2, NULL, 1);
 }
 
+static void state_reader(plotter_state_t *out) {
+    plotter_get_state(out);
+}
+
 static void init_task(void *arg) {
     ready_signal_isr_callback cb = (ready_signal_isr_callback)arg;
     printf("[core] init\n");
@@ -309,6 +313,7 @@ static void init_task(void *arg) {
 
     stm_link_init();
     oled_init();
+    oled_set_state_reader(state_reader);
     uart_link_init(STM32_UART_PORT, STM32_TX_PIN, STM32_RX_PIN, STM32_UART_BAUD);
     if (cb) stm_link_config_ready_pin(cb);
 
@@ -323,7 +328,7 @@ static void init_task(void *arg) {
 
 void plotter_init_sync(ready_signal_isr_callback cb) {
     if (!s_init_done) s_init_done = xSemaphoreCreateBinary();
-    xTaskCreatePinnedToCore(init_task, "plotter_io_init", 8192*2, (void*)cb, 9, NULL, 1);
+    xTaskCreatePinnedToCore(init_task, "plotter_io_init", 4096, (void*)cb, 9, NULL, 1);
     xSemaphoreTake(s_init_done, portMAX_DELAY);
 }
 
