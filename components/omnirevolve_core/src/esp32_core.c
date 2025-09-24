@@ -328,8 +328,6 @@ static void init_task(void *arg) {
 
 void plotter_init_sync(ready_signal_isr_callback cb) {
     if (!s_init_done) s_init_done = xSemaphoreCreateBinary();
-    xTaskCreatePinnedToCore(init_task, "plotter_io_init", 4096, (void*)cb, 9, NULL, 1);
+    xTaskCreatePinnedToCore(init_task, "plotter_io_init", 2*4096, (void*)cb, 9, NULL, 1);
     xSemaphoreTake(s_init_done, portMAX_DELAY);
 }
-
-void plotter_init(void) { plotter_init_sync(NULL); }

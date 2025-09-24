@@ -11,7 +11,7 @@
 #define STM32_SPI_MOSI    13
 #define STM32_SPI_MISO    -1
 #define STM32_SPI_CLK     14
-#define STM32_READY_PIN   15
+#define STM32_READY_PIN   35
 
 static spi_device_handle_t s_stm32 = NULL;
 
@@ -47,6 +47,7 @@ static void stm32_spi_init(void) {
 void stm_link_init(void) { stm32_spi_init(); }
 
 void stm_link_config_ready_pin(ready_signal_isr_callback cb) {
+    printf("stm_link_config_ready_pin called\n");
     gpio_config_t io = {
         .pin_bit_mask = 1ULL << STM32_READY_PIN,
         .mode = GPIO_MODE_INPUT,
@@ -68,6 +69,7 @@ void stm_link_send_draw_data(const uint8_t* data, uint32_t len) {
     }
     spi_transaction_t t = { .length = len * 8, .tx_buffer = data };
     esp_err_t ret = spi_device_transmit(s_stm32, &t);
+    printf("[stm_link] data sent to STM32\n");
     if (ret != ESP_OK) {
         printf("[stm_link] transmit failed: %s\n", esp_err_to_name(ret));
     }

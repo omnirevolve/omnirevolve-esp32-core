@@ -25,7 +25,6 @@ typedef struct {
 
 typedef void (*ready_signal_isr_callback)(void *arg);
 
-void plotter_init(void);
 void plotter_init_sync(ready_signal_isr_callback cb);
 void plotter_start_all_tasks(void);
 
