@@ -4,15 +4,7 @@
 [submodule "components/u8g2"]
 	path = components/u8g2
 	url = https://github.com/olikraus/u8g2.git
-[submodule "components/omnirevolve-protocol"]
-	path = components/omnirevolve-protocol
-	url = git@github.com:IvanNekrasov/omnirevolve-protocol.git
-	branch = main
 [submodule "components/omnirevolve_protocol"]
 	path = components/omnirevolve_protocol
-	url = git@github.com:IvanNekrasov/omnirevolve-protocol.git
-	branch = main
-[submodule "u8g2"]
-	url = https://github.com/olikraus/u8g2.git
-[submodule "omnirevolve-protocol"]
 	url = https://github.com/omnirevolve/omnirevolve-protocol.git
+	branch = main
